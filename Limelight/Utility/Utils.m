@@ -9,8 +9,13 @@
 #import "Utils.h"
 
 #include <arpa/inet.h>
-#include <netinet/in.h>
 #include <netdb.h>
+#include <net/if.h>
+#include <netinet/in.h>
+#include <ifaddrs.h>
+#include <sys/socket.h>
+#include <string.h>
+#include <unistd.h>
 
 static BOOL isDecimalPort(NSString *port) {
     if (port.length == 0 || port.length > 5) {
@@ -26,6 +31,149 @@ static BOOL isValidIPv6Literal(NSString *addr) {
     }
     struct in6_addr sa6;
     return inet_pton(AF_INET6, addr.UTF8String, &sa6) == 1;
+}
+
+static BOOL interfaceNameLooksLikeTunnel(NSString *ifname) {
+    NSString *name = ifname.lowercaseString;
+    if (name.length == 0) {
+        return NO;
+    }
+
+    // Common tunnel interfaces:
+    // - utun*: NetworkExtension/PacketTunnel (WireGuard, Tailscale, etc.)
+    // - tun*/tap*: classic VPN/tunnel adapters
+    // - ppp*/ipsec*: legacy VPN stacks
+    // - wg*: explicit WireGuard interfaces on some systems
+    return [name containsString:@"utun"] ||
+           [name containsString:@"wireguard"] ||
+           [name hasPrefix:@"wg"] ||
+           [name containsString:@"tap"] ||
+           [name containsString:@"tun"] ||
+           [name containsString:@"ppp"] ||
+           [name containsString:@"ipsec"];
+}
+
+static BOOL isSockaddrIpEqual(const struct sockaddr *left, const struct sockaddr *right) {
+    if (left == NULL || right == NULL || left->sa_family != right->sa_family) {
+        return NO;
+    }
+
+    if (left->sa_family == AF_INET) {
+        const struct sockaddr_in *l = (const struct sockaddr_in *)left;
+        const struct sockaddr_in *r = (const struct sockaddr_in *)right;
+        return l->sin_addr.s_addr == r->sin_addr.s_addr;
+    }
+
+    if (left->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *l = (const struct sockaddr_in6 *)left;
+        const struct sockaddr_in6 *r = (const struct sockaddr_in6 *)right;
+        return memcmp(&l->sin6_addr, &r->sin6_addr, sizeof(struct in6_addr)) == 0;
+    }
+
+    return NO;
+}
+
+static NSString *ipStringFromSockaddr(const struct sockaddr *address) {
+    if (address == NULL) {
+        return nil;
+    }
+
+    char ipBuffer[INET6_ADDRSTRLEN] = {0};
+    if (address->sa_family == AF_INET) {
+        const struct sockaddr_in *in = (const struct sockaddr_in *)address;
+        if (inet_ntop(AF_INET, &in->sin_addr, ipBuffer, sizeof(ipBuffer)) != NULL) {
+            return [NSString stringWithUTF8String:ipBuffer];
+        }
+    } else if (address->sa_family == AF_INET6) {
+        const struct sockaddr_in6 *in6 = (const struct sockaddr_in6 *)address;
+        if (inet_ntop(AF_INET6, &in6->sin6_addr, ipBuffer, sizeof(ipBuffer)) != NULL) {
+            return [NSString stringWithUTF8String:ipBuffer];
+        }
+    }
+
+    return nil;
+}
+
+static NSString *interfaceNameForLocalSockaddr(const struct sockaddr *localAddress) {
+    if (localAddress == NULL) {
+        return nil;
+    }
+
+    struct ifaddrs *ifaddr = NULL;
+    if (getifaddrs(&ifaddr) != 0 || ifaddr == NULL) {
+        return nil;
+    }
+
+    NSString *iface = nil;
+    for (struct ifaddrs *ifa = ifaddr; ifa != NULL; ifa = ifa->ifa_next) {
+        if (ifa->ifa_addr == NULL || ifa->ifa_name == NULL) {
+            continue;
+        }
+        if (!(ifa->ifa_flags & IFF_UP)) {
+            continue;
+        }
+        if (isSockaddrIpEqual(ifa->ifa_addr, localAddress)) {
+            iface = [NSString stringWithUTF8String:ifa->ifa_name];
+            break;
+        }
+    }
+
+    freeifaddrs(ifaddr);
+    return iface;
+}
+
+static NSString *outboundInterfaceNameForHost(NSString *host, NSString *port, NSString **sourceAddress) {
+    if (sourceAddress) {
+        *sourceAddress = nil;
+    }
+    if (host.length == 0) {
+        return nil;
+    }
+
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_DGRAM;
+    hints.ai_protocol = IPPROTO_UDP;
+
+    struct addrinfo *result = NULL;
+    int gaiErr = getaddrinfo(host.UTF8String, port.UTF8String, &hints, &result);
+    if (gaiErr != 0 || result == NULL) {
+        return nil;
+    }
+
+    NSString *iface = nil;
+    NSString *src = nil;
+
+    for (struct addrinfo *rp = result; rp != NULL; rp = rp->ai_next) {
+        int fd = socket(rp->ai_family, rp->ai_socktype, rp->ai_protocol);
+        if (fd < 0) {
+            continue;
+        }
+
+        if (connect(fd, rp->ai_addr, (socklen_t)rp->ai_addrlen) == 0) {
+            struct sockaddr_storage localStorage;
+            memset(&localStorage, 0, sizeof(localStorage));
+            socklen_t localLen = sizeof(localStorage);
+            if (getsockname(fd, (struct sockaddr *)&localStorage, &localLen) == 0) {
+                src = ipStringFromSockaddr((const struct sockaddr *)&localStorage);
+                iface = interfaceNameForLocalSockaddr((const struct sockaddr *)&localStorage);
+            }
+        }
+
+        close(fd);
+
+        if (iface.length > 0) {
+            break;
+        }
+    }
+
+    freeaddrinfo(result);
+
+    if (sourceAddress) {
+        *sourceAddress = src;
+    }
+    return iface;
 }
 
 @implementation Utils
@@ -113,14 +261,42 @@ NSString *const deviceName = @"roth";
     NSDictionary *dict = CFBridgingRelease(CFNetworkCopySystemProxySettings());
     NSArray *keys = [dict[@"__SCOPED__"] allKeys];
     for (NSString *key in keys) {
-        if ([key containsString:@"tap"] ||
-            [key containsString:@"tun"] ||
-            [key containsString:@"ppp"] ||
-            [key containsString:@"ipsec"]) {
+        if ([self isTunnelInterfaceName:key]) {
             return YES;
         }
     }
     return NO;
+}
+
++ (BOOL)isTunnelInterfaceName:(NSString *)ifname {
+    return interfaceNameLooksLikeTunnel(ifname);
+}
+
++ (nullable NSString *)outboundInterfaceNameForAddress:(NSString *)address
+                                         sourceAddress:(NSString * _Nullable * _Nullable)sourceAddress {
+    if (sourceAddress) {
+        *sourceAddress = nil;
+    }
+    if (address.length == 0) {
+        return nil;
+    }
+
+    NSString *host = nil;
+    NSString *port = nil;
+    [self parseAddress:address intoHost:&host andPort:&port];
+    if (host.length == 0) {
+        host = address;
+    }
+
+    NSString *probePort = @"47984";
+    if (isDecimalPort(port)) {
+        NSInteger parsedPort = [port integerValue];
+        if (parsedPort > 0 && parsedPort <= 65535) {
+            probePort = port;
+        }
+    }
+
+    return outboundInterfaceNameForHost(host, probePort, sourceAddress);
 }
 
 #if TARGET_OS_IPHONE

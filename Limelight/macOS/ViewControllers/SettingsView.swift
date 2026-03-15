@@ -108,14 +108,7 @@ struct SettingsView: View {
       if let hostId {
         settingsModel.selectHost(id: hostId)
       } else {
-        // If opened without hostId, verify if we should lock global (e.g. from main menu)
-        // For now, let's allow selection if no hostId is passed (or default to global but unlocked?)
-        // The requirement is "Homepage -> Global", "Host -> Host Profile".
-        // If we pass nil for Homepage, we can select Global and lock it?
-        // Or keep existing behavior (remember last selection).
-        // User said: "主页时是全局配置". So if we pass Global ID, we lock it.
-        // If we pass nil, maybe we just let it be?
-        // But we will modify callers to pass Global ID for homepage.
+        settingsModel.selectHost(id: SettingsModel.globalHostId)
       }
     }
   }
@@ -704,6 +697,11 @@ struct StreamView: View {
             }
           }
         }
+
+        Spacer()
+          .frame(height: 32)
+
+        StreamRiskSummarySection(assessment: settingsModel.streamRiskAssessment)
       }
       .padding()
       .onAppear {
@@ -827,6 +825,11 @@ struct VideoView: View {
             title: "Show Connection Warnings",
             boolBinding: $settingsModel.showConnectionWarnings)
         }
+
+        Spacer()
+          .frame(height: 32)
+
+        StreamRiskSummarySection(assessment: settingsModel.streamRiskAssessment)
       }
       .padding()
     }
@@ -1188,7 +1191,7 @@ struct AppView: View {
   @SwiftUI.State private var showResetDone = false
   @SwiftUI.State private var resetDoneMessageKey = ""
 
-  private func debugLogFileURL() -> URL? {
+  private func debugLogFileURL(fileName: String) -> URL? {
     guard let libraryDir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first
     else {
       return nil
@@ -1196,12 +1199,20 @@ struct AppView: View {
     return libraryDir
       .appendingPathComponent("Logs", isDirectory: true)
       .appendingPathComponent("Moonlight", isDirectory: true)
-      .appendingPathComponent("moonlight-debug.log", isDirectory: false)
+      .appendingPathComponent(fileName, isDirectory: false)
+  }
+
+  private func rawDebugLogFileURL() -> URL? {
+    debugLogFileURL(fileName: "moonlight-debug.log")
+  }
+
+  private func curatedDebugLogFileURL() -> URL? {
+    debugLogFileURL(fileName: "moonlight-debug-curated.log")
   }
 
   @MainActor
   private func openDebugLogFolder() {
-    guard let logURL = debugLogFileURL() else { return }
+    guard let logURL = rawDebugLogFileURL() else { return }
     let dirURL = logURL.deletingLastPathComponent()
     try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
     NSWorkspace.shared.activateFileViewerSelecting([dirURL])
@@ -1213,8 +1224,8 @@ struct AppView: View {
   }
 
   @MainActor
-  private func exportDebugLog() {
-    guard let logURL = debugLogFileURL() else { return }
+  private func exportRawDebugLog() {
+    guard let logURL = rawDebugLogFileURL() else { return }
     let dirURL = logURL.deletingLastPathComponent()
     try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
@@ -1250,7 +1261,8 @@ struct AppView: View {
 
   @MainActor
   private func openDebugLogInExternalEditor() {
-    guard let logURL = debugLogFileURL() else { return }
+    let fileName = settingsModel.debugLogMode == "raw" ? "moonlight-debug.log" : "moonlight-debug-curated.log"
+    guard let logURL = debugLogFileURL(fileName: fileName) else { return }
     let dirURL = logURL.deletingLastPathComponent()
     try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
 
@@ -1353,8 +1365,8 @@ struct AppView: View {
                   openDebugLogInExternalEditor()
                 }
               }
-              Button(languageManager.localize("Export Log…")) {
-                exportDebugLog()
+              Button(languageManager.localize("Export Raw Log…")) {
+                exportRawDebugLog()
               }
             }
           }
@@ -1389,7 +1401,8 @@ struct AppView: View {
       .padding()
     }
     .sheet(isPresented: $showLiveLogViewer) {
-      DebugLogLiveView(logURL: debugLogFileURL())
+      DebugLogLiveView(rawLogURL: rawDebugLogFileURL(), curatedLogURL: curatedDebugLogFileURL())
+        .environmentObject(settingsModel)
     }
     .alert(languageManager.localize("Dangerous Operation"), isPresented: $showHostResetConfirm) {
       Button(languageManager.localize("Cancel"), role: .cancel) {}
@@ -1422,26 +1435,47 @@ struct AppView: View {
   }
 }
 
-private final class DebugLogTailModel: ObservableObject {
-  @Published var logText: String = ""
+private enum DebugLogViewMode: String {
+  case curated
+  case raw
+}
 
-  private let logURL: URL
+private enum DebugLogTimeScope: String {
+  case all
+  case launch = "launch"
+  case sinceClear = "since_clear"
+}
+
+private final class DebugLogLiveModel: ObservableObject {
+  @Published var refreshToken = UUID()
+
+  private let rawLogURL: URL
+  private let curatedLogURL: URL
+  private let maxRetainedLines = 3000
+  private let initialTailBytes: UInt64 = 1_024 * 1_024
+  private var rawText: String = ""
+  private var curatedText: String = ""
+  private var rawFileSize: UInt64 = 0
+  private var curatedFileSize: UInt64 = 0
   private var timer: Timer?
-  private var lastOffset: UInt64 = 0
 
-  init(logURL: URL) {
-    self.logURL = logURL
+  init(rawLogURL: URL, curatedLogURL: URL) {
+    self.rawLogURL = rawLogURL
+    self.curatedLogURL = curatedLogURL
   }
 
   func start() {
-    ensureLogFileExists()
-    reloadEntireFile()
+    ensureLogFileExists(at: rawLogURL)
+    ensureLogFileExists(at: curatedLogURL)
+    reloadAll()
 
     timer?.invalidate()
     timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
       self?.pollForUpdates()
     }
-    RunLoop.main.add(timer!, forMode: .common)
+    if let timer {
+      RunLoop.main.add(timer, forMode: .common)
+    }
   }
 
   func stop() {
@@ -1449,78 +1483,360 @@ private final class DebugLogTailModel: ObservableObject {
     timer = nil
   }
 
-  func copyAll() {
-    NSPasteboard.general.clearContents()
-    NSPasteboard.general.setString(logText, forType: .string)
+  func entries(
+    mode: DebugLogViewMode,
+    minimumLevel: DebugLogLevel,
+    showSystemNoise: Bool
+  ) -> [DebugLogEntry] {
+    switch mode {
+    case .raw:
+      return DebugLogParser.parseEntries(from: rawText).filter {
+        DebugLogParser.matchesMinimumLevel($0.level, minimumLevel: minimumLevel)
+      }
+    case .curated:
+      if showSystemNoise {
+        return DebugLogParser.curatedEntries(
+          fromRawText: rawText,
+          minimumLevel: minimumLevel,
+          showSystemNoise: true
+        )
+      }
+      if !curatedText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+        return DebugLogParser.parseEntries(from: curatedText).filter {
+          DebugLogParser.matchesMinimumLevel($0.level, minimumLevel: minimumLevel)
+        }
+      }
+      return DebugLogParser.curatedEntries(
+        fromRawText: rawText,
+        minimumLevel: minimumLevel,
+        showSystemNoise: false
+      )
+    }
   }
 
-  private func ensureLogFileExists() {
-    let dirURL = logURL.deletingLastPathComponent()
+  private func ensureLogFileExists(at url: URL) {
+    let dirURL = url.deletingLastPathComponent()
     try? FileManager.default.createDirectory(at: dirURL, withIntermediateDirectories: true)
-    if !FileManager.default.fileExists(atPath: logURL.path) {
-      try? "".write(to: logURL, atomically: true, encoding: .utf8)
+    if !FileManager.default.fileExists(atPath: url.path) {
+      try? "".write(to: url, atomically: true, encoding: .utf8)
     }
   }
 
-  private func reloadEntireFile() {
-    guard let data = try? Data(contentsOf: logURL) else {
-      logText = ""
-      lastOffset = 0
-      return
-    }
-
-    logText = String(data: data, encoding: .utf8) ?? ""
-    lastOffset = UInt64(data.count)
+  private func reloadAll() {
+    rawText = readTailText(from: rawLogURL, maxBytes: initialTailBytes)
+    curatedText = readTailText(from: curatedLogURL, maxBytes: initialTailBytes)
+    rawFileSize = fileSize(of: rawLogURL)
+    curatedFileSize = fileSize(of: curatedLogURL)
+    refreshToken = UUID()
   }
 
   private func pollForUpdates() {
-    let attrs = try? FileManager.default.attributesOfItem(atPath: logURL.path)
-    let fileSize = (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+    var changed = false
 
-    if fileSize < lastOffset {
-      // File rotated/truncated
-      reloadEntireFile()
-      return
+    let latestRawSize = fileSize(of: rawLogURL)
+    if latestRawSize < rawFileSize {
+      rawText = readTailText(from: rawLogURL, maxBytes: initialTailBytes)
+      rawFileSize = latestRawSize
+      changed = true
+    } else if latestRawSize > rawFileSize {
+      if let delta = readDeltaText(from: rawLogURL, startOffset: rawFileSize) {
+        rawText = trimToLastLines(rawText + delta, maxLines: maxRetainedLines)
+      }
+      rawFileSize = latestRawSize
+      changed = true
     }
 
-    guard fileSize > lastOffset else {
-      return
+    let latestCuratedSize = fileSize(of: curatedLogURL)
+    if latestCuratedSize < curatedFileSize {
+      curatedText = readTailText(from: curatedLogURL, maxBytes: initialTailBytes)
+      curatedFileSize = latestCuratedSize
+      changed = true
+    } else if latestCuratedSize > curatedFileSize {
+      if let delta = readDeltaText(from: curatedLogURL, startOffset: curatedFileSize) {
+        curatedText = trimToLastLines(curatedText + delta, maxLines: maxRetainedLines)
+      }
+      curatedFileSize = latestCuratedSize
+      changed = true
     }
 
-    guard let file = try? FileHandle(forReadingFrom: logURL) else {
-      return
+    if changed {
+      refreshToken = UUID()
     }
+  }
 
-    defer {
-      try? file.close()
+  private func fileSize(of url: URL) -> UInt64 {
+    let attrs = try? FileManager.default.attributesOfItem(atPath: url.path)
+    return (attrs?[.size] as? NSNumber)?.uint64Value ?? 0
+  }
+
+  private func readTailText(from url: URL, maxBytes: UInt64) -> String {
+    let size = fileSize(of: url)
+    guard let file = try? FileHandle(forReadingFrom: url) else {
+      return ""
     }
+    defer { try? file.close() }
 
     do {
-      try file.seek(toOffset: lastOffset)
-      let newData = try file.readToEnd() ?? Data()
-      if !newData.isEmpty {
-        let delta = String(data: newData, encoding: .utf8) ?? ""
-        logText += delta
+      if size > maxBytes {
+        try file.seek(toOffset: size - maxBytes)
+      } else {
+        try file.seek(toOffset: 0)
       }
-      lastOffset = fileSize
+      let data = try file.readToEnd() ?? Data()
+      return trimToLastLines(String(decoding: data, as: UTF8.self), maxLines: maxRetainedLines)
     } catch {
-      // Ignore transient read failures; next poll will retry.
+      return ""
     }
+  }
+
+  private func readDeltaText(from url: URL, startOffset: UInt64) -> String? {
+    guard let file = try? FileHandle(forReadingFrom: url) else {
+      return nil
+    }
+    defer { try? file.close() }
+
+    do {
+      try file.seek(toOffset: startOffset)
+      let data = try file.readToEnd() ?? Data()
+      guard !data.isEmpty else { return nil }
+      return String(decoding: data, as: UTF8.self)
+    } catch {
+      return nil
+    }
+  }
+
+  private func trimToLastLines(_ text: String, maxLines: Int) -> String {
+    guard maxLines > 0 else { return text }
+    let lines = text.split(separator: "\n", omittingEmptySubsequences: false)
+    guard lines.count > maxLines else { return text }
+    return lines.suffix(maxLines).joined(separator: "\n")
+  }
+}
+
+private struct DebugLogLevelBadge: View {
+  let level: DebugLogLevel
+
+  private var color: Color {
+    switch level {
+    case .debug:
+      return .gray
+    case .info:
+      return .blue
+    case .warn:
+      return .orange
+    case .error:
+      return .red
+    case .all, .unknown:
+      return .secondary
+    }
+  }
+
+  var body: some View {
+    Text(level.displayText.uppercased())
+      .font(.system(size: 10, weight: .bold, design: .monospaced))
+      .padding(.horizontal, 6)
+      .padding(.vertical, 2)
+      .foregroundColor(.white)
+      .background(RoundedRectangle(cornerRadius: 4).fill(color))
+  }
+}
+
+private struct DebugLogRowView: View {
+  let entry: DebugLogEntry
+
+  var body: some View {
+    HStack(alignment: .top, spacing: 8) {
+      Text(entry.timestampText ?? "--")
+        .font(.system(size: 11, design: .monospaced))
+        .foregroundColor(.secondary)
+        .frame(width: 170, alignment: .leading)
+
+      DebugLogLevelBadge(level: entry.level)
+        .frame(width: 58, alignment: .leading)
+
+      VStack(alignment: .leading, spacing: 2) {
+        Text(entry.message.isEmpty ? entry.rawLine : entry.message)
+          .font(.system(size: 12, design: .monospaced))
+          .textSelection(.enabled)
+          .frame(maxWidth: .infinity, alignment: .leading)
+
+        if entry.count > 1 {
+          Text("×\(entry.count)")
+            .font(.system(size: 11, weight: .semibold, design: .monospaced))
+            .foregroundColor(.secondary)
+        }
+      }
+    }
+    .padding(.horizontal, 8)
+    .padding(.vertical, 4)
+    .background(
+      entry.isNoiseSummary ? Color.orange.opacity(0.07) : Color.clear
+    )
+    .cornerRadius(4)
   }
 }
 
 private struct DebugLogLiveView: View {
   @Environment(\.dismiss) private var dismiss
-  @StateObject private var model: DebugLogTailModel
+  @EnvironmentObject private var settingsModel: SettingsModel
   @ObservedObject var languageManager = LanguageManager.shared
+  @StateObject private var model: DebugLogLiveModel
+  @SwiftUI.State private var searchText: String = ""
+  @SwiftUI.State private var renderedEntries: [DebugLogEntry] = []
+  @SwiftUI.State private var totalRows: Int = 0
+  @SwiftUI.State private var detailEntry: DebugLogEntry?
+  @SwiftUI.State private var clearFromDate: Date?
+  @SwiftUI.State private var appLaunchDate: Date = NSRunningApplication.current.launchDate ?? Date()
 
-  init(logURL: URL?) {
-    let fallbackURL = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
+  init(rawLogURL: URL?, curatedLogURL: URL?) {
+    let baseDir = FileManager.default.urls(for: .libraryDirectory, in: .userDomainMask).first?
       .appendingPathComponent("Logs", isDirectory: true)
       .appendingPathComponent("Moonlight", isDirectory: true)
-      .appendingPathComponent("moonlight-debug.log", isDirectory: false)
-      ?? URL(fileURLWithPath: NSTemporaryDirectory()).appendingPathComponent("moonlight-debug.log")
-    _model = StateObject(wrappedValue: DebugLogTailModel(logURL: logURL ?? fallbackURL))
+      ?? URL(fileURLWithPath: NSTemporaryDirectory())
+    let fallbackRaw = baseDir.appendingPathComponent("moonlight-debug.log")
+    let fallbackCurated = baseDir.appendingPathComponent("moonlight-debug-curated.log")
+    _model = SwiftUI.StateObject(
+      wrappedValue: DebugLogLiveModel(
+        rawLogURL: rawLogURL ?? fallbackRaw,
+        curatedLogURL: curatedLogURL ?? fallbackCurated
+      ))
+  }
+
+  private var currentMode: DebugLogViewMode {
+    settingsModel.debugLogMode == "raw" ? .raw : .curated
+  }
+
+  private var currentMinimumLevel: DebugLogLevel {
+    switch settingsModel.debugLogMinLevel {
+    case "all": return .all
+    case "debug": return .debug
+    case "warn": return .warn
+    case "error": return .error
+    default: return .info
+    }
+  }
+
+  private var currentTimeScope: DebugLogTimeScope {
+    DebugLogTimeScope(rawValue: settingsModel.debugLogTimeScope) ?? .launch
+  }
+
+  private var effectiveStartDate: Date? {
+    switch currentTimeScope {
+    case .all:
+      return nil
+    case .launch:
+      return appLaunchDate
+    case .sinceClear:
+      return clearFromDate ?? appLaunchDate
+    }
+  }
+
+  private static let logTimestampFormatter: DateFormatter = {
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.dateFormat = "yyyy-MM-dd HH:mm:ss.SSS"
+    return formatter
+  }()
+
+  private func filterEntriesByTimeScope(_ entries: [DebugLogEntry]) -> [DebugLogEntry] {
+    guard let startDate = effectiveStartDate else {
+      return entries
+    }
+    return entries.filter { entry in
+      if let ts = entry.timestamp {
+        return ts >= startDate
+      }
+      if let text = entry.timestampText, let parsed = Self.logTimestampFormatter.date(from: text) {
+        return parsed >= startDate
+      }
+      return false
+    }
+  }
+
+  private func refreshRenderedEntries() {
+    let base = model.entries(
+      mode: currentMode,
+      minimumLevel: currentMinimumLevel,
+      showSystemNoise: settingsModel.debugLogShowSystemNoise
+    )
+    let scopedBase = filterEntriesByTimeScope(base)
+    let foldedBase = DebugLogParser.foldConsecutiveDuplicates(scopedBase)
+    totalRows = foldedBase.count
+
+    let keyword = searchText.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+    renderedEntries = foldedBase.filter { entry in
+      let keywordPass: Bool
+      if keyword.isEmpty {
+        keywordPass = true
+      } else {
+        keywordPass = entry.searchableText.lowercased().contains(keyword)
+      }
+      return keywordPass
+    }
+  }
+
+  private func copyFilteredEntries() {
+    let text = renderedEntries.map(\.rawLine).joined(separator: "\n")
+    NSPasteboard.general.clearContents()
+    NSPasteboard.general.setString(text, forType: .string)
+  }
+
+  private func exportFilteredEntries() {
+    let snapshotEntries = renderedEntries
+    let snapshotMode = settingsModel.debugLogMode
+    let snapshotMinLevel = settingsModel.debugLogMinLevel
+    let snapshotShowNoise = settingsModel.debugLogShowSystemNoise
+    let snapshotSearch = searchText
+    let snapshotTotalRows = totalRows
+    let snapshotTimeScope = settingsModel.debugLogTimeScope
+    let snapshotStartDate = effectiveStartDate
+
+    let panel = NSSavePanel()
+    panel.canCreateDirectories = true
+    panel.nameFieldStringValue = "moonlight-debug-filtered.log"
+    if #available(macOS 11.0, *) {
+      panel.allowedContentTypes = [.plainText]
+    } else {
+      panel.allowedFileTypes = ["log", "txt"]
+    }
+
+    let header = """
+      # Moonlight Filtered Log
+      # Generated: \(ISO8601DateFormatter().string(from: Date()))
+      # Log Mode: \(snapshotMode)
+      # Min Level: \(snapshotMinLevel)
+      # Show System Noise: \(snapshotShowNoise)
+      # Search: \(snapshotSearch.isEmpty ? "(empty)" : snapshotSearch)
+      # Time Scope: \(snapshotTimeScope)
+      # Start At: \(snapshotStartDate.map { ISO8601DateFormatter().string(from: $0) } ?? "(none)")
+      # Filtered Rows: \(snapshotEntries.count)
+      # Total Rows: \(snapshotTotalRows)
+
+      """
+    let body = snapshotEntries.map(\.rawLine).joined(separator: "\n")
+    let content = header + body + "\n"
+
+    let saveAction: (URL) -> Void = { destinationURL in
+      DispatchQueue.global(qos: .userInitiated).async {
+        do {
+          try content.write(to: destinationURL, atomically: true, encoding: .utf8)
+        } catch {
+          DispatchQueue.main.async {
+            NSApp.presentError(error)
+          }
+        }
+      }
+    }
+
+    if let window = NSApp.keyWindow ?? NSApp.mainWindow {
+      panel.beginSheetModal(for: window) { response in
+        if response == .OK, let destinationURL = panel.url {
+          saveAction(destinationURL)
+        }
+      }
+    } else if panel.runModal() == .OK, let destinationURL = panel.url {
+      saveAction(destinationURL)
+    }
   }
 
   var body: some View {
@@ -1529,43 +1845,215 @@ private struct DebugLogLiveView: View {
         Text(languageManager.localize("Live Debug Log"))
           .font(.headline)
         Spacer()
+        Button(languageManager.localize("Export Filtered Log…")) {
+          exportFilteredEntries()
+        }
         Button(languageManager.localize("Copy All")) {
-          model.copyAll()
+          copyFilteredEntries()
         }
         Button(languageManager.localize("Close")) {
           dismiss()
         }
       }
 
+      HStack(spacing: 8) {
+        Text(languageManager.localize("Log Mode"))
+          .font(.caption)
+          .foregroundColor(.secondary)
+        Picker("", selection: $settingsModel.debugLogMode) {
+          Text(languageManager.localize("Curated Log")).tag("curated")
+          Text(languageManager.localize("Raw Log")).tag("raw")
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 230)
+
+        Picker("", selection: $settingsModel.debugLogMinLevel) {
+          Text("All").tag("all")
+          Text("Debug").tag("debug")
+          Text("Info").tag("info")
+          Text("Warn").tag("warn")
+          Text("Error").tag("error")
+        }
+        .frame(width: 140)
+
+        Toggle(languageManager.localize("Show System Noise"), isOn: $settingsModel.debugLogShowSystemNoise)
+          .toggleStyle(.checkbox)
+          .frame(width: 180, alignment: .leading)
+
+        Toggle(languageManager.localize("Auto Scroll"), isOn: $settingsModel.debugLogAutoScroll)
+          .toggleStyle(.checkbox)
+          .frame(width: 130, alignment: .leading)
+      }
+
+      HStack(spacing: 8) {
+        Text(languageManager.localize("Log Range"))
+          .font(.caption)
+          .foregroundColor(.secondary)
+        Picker("", selection: $settingsModel.debugLogTimeScope) {
+          Text(languageManager.localize("All History")).tag("all")
+          Text(languageManager.localize("This Launch")).tag("launch")
+          Text(languageManager.localize("Since Clear")).tag("since_clear")
+        }
+        .pickerStyle(.segmented)
+        .frame(width: 280)
+
+        Button(languageManager.localize("Clear From Now")) {
+          clearFromDate = Date()
+          settingsModel.debugLogTimeScope = DebugLogTimeScope.sinceClear.rawValue
+          refreshRenderedEntries()
+        }
+
+        if let startDate = effectiveStartDate, currentTimeScope != .all {
+          Text("\(languageManager.localize("Since")): \(Self.logTimestampFormatter.string(from: startDate))")
+            .font(.caption)
+            .foregroundColor(.secondary)
+        }
+
+        Spacer()
+      }
+
+      HStack(spacing: 8) {
+        TextField("Search...", text: $searchText)
+          .textFieldStyle(.roundedBorder)
+
+        Text("\(languageManager.localize("Filtered Rows")): \(renderedEntries.count)")
+          .font(.caption)
+          .foregroundColor(.secondary)
+        Text("\(languageManager.localize("Total Rows")): \(totalRows)")
+          .font(.caption)
+          .foregroundColor(.secondary)
+      }
+
       ScrollViewReader { proxy in
         ScrollView {
-          Text(model.logText.isEmpty ? languageManager.localize("(No logs yet)") : model.logText)
-            .font(.system(.caption, design: .monospaced))
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .textSelection(.enabled)
-            .id("log-end")
-            .padding(8)
+          LazyVStack(alignment: .leading, spacing: 2) {
+            if renderedEntries.isEmpty {
+              Text(languageManager.localize("(No logs yet)"))
+                .font(.system(.caption, design: .monospaced))
+                .foregroundColor(.secondary)
+                .padding(.horizontal, 8)
+                .padding(.vertical, 16)
+            } else {
+              ForEach(renderedEntries) { entry in
+                DebugLogRowView(entry: entry)
+                  .id(entry.id)
+                  .contentShape(Rectangle())
+                  .onTapGesture(count: 2) {
+                    detailEntry = entry
+                  }
+              }
+            }
+            Color.clear
+              .frame(height: 1)
+              .id("log-end")
+          }
+          .padding(.vertical, 4)
         }
         .background(Color(NSColor.textBackgroundColor))
         .overlay(
           RoundedRectangle(cornerRadius: 6)
             .stroke(Color.secondary.opacity(0.2), lineWidth: 1)
         )
-        .onChange(of: model.logText) { _ in
-          withAnimation(.easeOut(duration: 0.15)) {
+        .onChange(of: renderedEntries.count) { _ in
+          guard settingsModel.debugLogAutoScroll else { return }
+          withAnimation(.easeOut(duration: 0.12)) {
             proxy.scrollTo("log-end", anchor: .bottom)
           }
         }
       }
     }
     .padding(16)
-    .frame(minWidth: 760, minHeight: 460)
+    .frame(minWidth: 980, minHeight: 560)
     .onAppear {
+      appLaunchDate = NSRunningApplication.current.launchDate ?? Date()
       model.start()
+      refreshRenderedEntries()
     }
     .onDisappear {
       model.stop()
     }
+    .onReceive(model.$refreshToken) { _ in
+      refreshRenderedEntries()
+    }
+    .onChange(of: settingsModel.debugLogMode) { _ in
+      refreshRenderedEntries()
+    }
+    .onChange(of: settingsModel.debugLogShowSystemNoise) { _ in
+      refreshRenderedEntries()
+    }
+    .onChange(of: searchText) { _ in
+      refreshRenderedEntries()
+    }
+    .onChange(of: settingsModel.debugLogMinLevel) { _ in
+      refreshRenderedEntries()
+    }
+    .onChange(of: settingsModel.debugLogTimeScope) { _ in
+      if currentTimeScope == .sinceClear && clearFromDate == nil {
+        clearFromDate = Date()
+      }
+      refreshRenderedEntries()
+    }
+    .sheet(item: $detailEntry) { entry in
+      DebugLogEntryDetailView(entry: entry)
+    }
+  }
+}
+
+private struct DebugLogEntryDetailView: View {
+  let entry: DebugLogEntry
+  @Environment(\.dismiss) private var dismiss
+
+  var body: some View {
+    VStack(spacing: 12) {
+      HStack {
+        Text("Log Detail")
+          .font(.headline)
+        Spacer()
+        Button("Close") {
+          dismiss()
+        }
+      }
+
+      HStack(spacing: 8) {
+        DebugLogLevelBadge(level: entry.level)
+        Text(entry.timestampText ?? "--")
+          .font(.system(size: 12, design: .monospaced))
+          .foregroundColor(.secondary)
+        if entry.count > 1 {
+          Text("×\(entry.count)")
+            .font(.system(size: 12, weight: .semibold, design: .monospaced))
+            .foregroundColor(.secondary)
+        }
+        Spacer()
+      }
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text("Message")
+          .font(.caption)
+          .foregroundColor(.secondary)
+        Text(entry.message.isEmpty ? entry.rawLine : entry.message)
+          .font(.system(size: 12, design: .monospaced))
+          .textSelection(.enabled)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+
+      Divider()
+
+      VStack(alignment: .leading, spacing: 6) {
+        Text("Raw Line")
+          .font(.caption)
+          .foregroundColor(.secondary)
+        ScrollView {
+          Text(entry.rawLine)
+            .font(.system(size: 12, design: .monospaced))
+            .textSelection(.enabled)
+            .frame(maxWidth: .infinity, alignment: .leading)
+        }
+      }
+      Spacer()
+    }
+    .padding(16)
+    .frame(minWidth: 760, minHeight: 360)
   }
 }
 
@@ -1581,6 +2069,139 @@ struct LegacyView: View {
         }
       }
       .padding()
+    }
+  }
+}
+
+
+struct StreamRiskSummarySection: View {
+  let assessment: StreamRiskAssessment
+  @ObservedObject var languageManager = LanguageManager.shared
+  @SwiftUI.State private var isExpanded = false
+
+  private var riskColor: Color {
+    switch assessment.riskLevel {
+    case .low:
+      return .secondary
+    case .medium:
+      return .blue
+    case .high:
+      return .purple
+    }
+  }
+
+  var body: some View {
+    FormSection(title: "Profile Assessment") {
+      DisclosureGroup(isExpanded: $isExpanded) {
+        VStack(alignment: .leading, spacing: 8) {
+          Text(languageManager.localize("Profile assessment hint"))
+            .font(.footnote)
+            .foregroundColor(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+          Divider()
+
+          HStack {
+            Text(languageManager.localize("Profile Level"))
+            Spacer()
+            Text(assessment.riskLabel)
+              .font(.system(.body, design: .rounded).weight(.semibold))
+              .foregroundColor(riskColor)
+          }
+
+          Divider()
+
+          HStack {
+            Text(languageManager.localize("Route Tier"))
+            Spacer()
+            Text(assessment.routeLabel)
+              .foregroundColor(.secondary)
+          }
+
+          Divider()
+
+          HStack {
+            Text(languageManager.localize("Video Codec"))
+            Spacer()
+            Text("\(assessment.codecName) · \(assessment.chromaName)")
+              .foregroundColor(.secondary)
+          }
+
+          Divider()
+
+          HStack {
+            Text(languageManager.localize("Compression Budget"))
+            Spacer()
+            Text("\(assessment.bpppfText) bpppf")
+              .availableMonospacedDigit()
+              .foregroundColor(.secondary)
+          }
+
+          Divider()
+
+          HStack {
+            Text(languageManager.localize("Pixel Rate"))
+            Spacer()
+            Text(assessment.pixelRateText)
+              .availableMonospacedDigit()
+              .foregroundColor(.secondary)
+          }
+
+          if assessment.displayRefreshRateHz > 0 {
+            Divider()
+
+            HStack {
+              Text(languageManager.localize("Display Refresh"))
+              Spacer()
+              Text(String(format: "%.0f Hz", assessment.displayRefreshRateHz))
+                .availableMonospacedDigit()
+                .foregroundColor(.secondary)
+            }
+          }
+
+          if !assessment.reasons.isEmpty {
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+              Text(languageManager.localize("Assessment Reasons"))
+                .font(.footnote.weight(.semibold))
+                .foregroundColor(.secondary)
+
+              ForEach(Array(assessment.reasons.prefix(3)), id: \.self) { reason in
+                Text("• \(reason)")
+                  .font(.footnote)
+                  .foregroundColor(.secondary)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+              }
+            }
+          }
+
+          if !assessment.recommendedFallbacks.isEmpty {
+            Divider()
+
+            VStack(alignment: .leading, spacing: 6) {
+              Text(languageManager.localize("Suggested Fallbacks"))
+                .font(.footnote.weight(.semibold))
+                .foregroundColor(.secondary)
+
+              ForEach(Array(assessment.recommendedFallbacks.prefix(3)), id: \.summaryLine) { recommendation in
+                Text("• \(recommendation.summaryLine)")
+                  .font(.footnote)
+                  .foregroundColor(.secondary)
+                  .frame(maxWidth: .infinity, alignment: .leading)
+              }
+            }
+          }
+        }
+      } label: {
+        HStack {
+          Text(languageManager.localize("Analyze Current Profile"))
+          Spacer()
+          Text(isExpanded ? languageManager.localize("Expanded") : languageManager.localize("Tap to Analyze"))
+            .font(.footnote)
+            .foregroundColor(.secondary)
+        }
+      }
     }
   }
 }

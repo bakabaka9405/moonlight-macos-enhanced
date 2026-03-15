@@ -20,6 +20,13 @@
 
 @implementation AppsWorkspaceViewController
 
+- (NSString *)currentHostUUID {
+    if (self.appsViewController.host.uuid.length > 0) {
+        return self.appsViewController.host.uuid;
+    }
+    return self.initialHost.uuid;
+}
+
 - (instancetype)initWithHost:(TemporaryHost *)host {
     return [self initWithHost:host hostsSnapshot:@[]];
 }

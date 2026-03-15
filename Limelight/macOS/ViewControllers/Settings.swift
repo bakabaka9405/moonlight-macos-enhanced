@@ -110,39 +110,54 @@ class SettingsClass: NSObject {
 
   private static func copy(
     _ settings: Settings,
-    connectionMethod: String? = nil,
-    mouseMode: Int? = nil,
+    resolution: CGSize? = nil,
+    matchDisplayResolution: Bool? = nil,
+    customResolution: CGSize?? = nil,
+    fps: Int? = nil,
+    customFps: CGFloat?? = nil,
     autoAdjustBitrate: Bool? = nil,
+    enableYUV444: Bool? = nil,
+    streamResolutionScale: Bool? = nil,
+    streamResolutionScaleRatio: Int? = nil,
+    remoteResolution: Bool? = nil,
+    remoteResolutionWidth: Int?? = nil,
+    remoteResolutionHeight: Int?? = nil,
+    remoteFps: Bool? = nil,
+    remoteFpsRate: Int?? = nil,
     bitrate: Int? = nil,
     customBitrate: Int?? = nil,
+    codec: Int? = nil,
+    hdr: Bool? = nil,
+    connectionMethod: String? = nil,
+    mouseMode: Int? = nil,
     volumeLevel: CGFloat? = nil
   ) -> Settings {
     Settings(
-      resolution: settings.resolution,
-      matchDisplayResolution: settings.matchDisplayResolution,
-      customResolution: settings.customResolution,
-      fps: settings.fps,
-      customFps: settings.customFps,
+      resolution: resolution ?? settings.resolution,
+      matchDisplayResolution: matchDisplayResolution ?? settings.matchDisplayResolution,
+      customResolution: customResolution != nil ? customResolution! : settings.customResolution,
+      fps: fps ?? settings.fps,
+      customFps: customFps != nil ? customFps! : settings.customFps,
 
       autoAdjustBitrate: autoAdjustBitrate ?? settings.autoAdjustBitrate,
-      enableYUV444: settings.enableYUV444,
+      enableYUV444: enableYUV444 ?? settings.enableYUV444,
       ignoreAspectRatio: settings.ignoreAspectRatio,
       showLocalCursor: settings.showLocalCursor,
       enableMicrophone: settings.enableMicrophone,
-      streamResolutionScale: settings.streamResolutionScale,
-      streamResolutionScaleRatio: settings.streamResolutionScaleRatio,
+      streamResolutionScale: streamResolutionScale ?? settings.streamResolutionScale,
+      streamResolutionScaleRatio: streamResolutionScaleRatio ?? settings.streamResolutionScaleRatio,
 
-      remoteResolution: settings.remoteResolution,
-      remoteResolutionWidth: settings.remoteResolutionWidth,
-      remoteResolutionHeight: settings.remoteResolutionHeight,
-      remoteFps: settings.remoteFps,
-      remoteFpsRate: settings.remoteFpsRate,
+      remoteResolution: remoteResolution ?? settings.remoteResolution,
+      remoteResolutionWidth: remoteResolutionWidth != nil ? remoteResolutionWidth! : settings.remoteResolutionWidth,
+      remoteResolutionHeight: remoteResolutionHeight != nil ? remoteResolutionHeight! : settings.remoteResolutionHeight,
+      remoteFps: remoteFps ?? settings.remoteFps,
+      remoteFpsRate: remoteFpsRate != nil ? remoteFpsRate! : settings.remoteFpsRate,
 
       bitrate: bitrate ?? settings.bitrate,
       customBitrate: customBitrate != nil ? customBitrate! : settings.customBitrate,
       unlockMaxBitrate: settings.unlockMaxBitrate,
-      codec: settings.codec,
-      hdr: settings.hdr,
+      codec: codec ?? settings.codec,
+      hdr: hdr ?? settings.hdr,
       framePacing: settings.framePacing,
       audioOnPC: settings.audioOnPC,
       audioConfiguration: settings.audioConfiguration,
@@ -478,6 +493,43 @@ class SettingsClass: NSObject {
       // Logic to update bitrate was incomplete and causing unused variable warnings.
       // Leaving this block empty as the original implementation did not persist changes.
     }
+
+    persist(updated, for: key)
+  }
+
+  @objc static func applyStreamRecommendation(_ recommendation: StreamRiskRecommendation, for key: String) {
+    guard let settings = Settings.getSettings(for: key) else {
+      return
+    }
+
+    let codec = SettingsModel.getInt(from: recommendation.codecName, in: SettingsModel.videoCodecs)
+    let remoteResolutionEnabled = settings.remoteResolution ?? false
+    let remoteFpsEnabled = settings.remoteFps ?? false
+    let customResolution = CGSize(width: recommendation.width, height: recommendation.height)
+    let explicitCustomResolution: CGSize? = customResolution
+    let explicitCustomFps: CGFloat? = CGFloat(recommendation.fps)
+    let explicitRemoteWidth: Int? = remoteResolutionEnabled ? recommendation.width : nil
+    let explicitRemoteHeight: Int? = remoteResolutionEnabled ? recommendation.height : nil
+    let explicitRemoteFps: Int? = remoteFpsEnabled ? recommendation.fps : nil
+
+    let updated = copy(
+      settings,
+      resolution: .zero,
+      matchDisplayResolution: false,
+      customResolution: .some(explicitCustomResolution),
+      fps: 0,
+      customFps: .some(explicitCustomFps),
+      enableYUV444: recommendation.enableYUV444,
+      streamResolutionScale: false,
+      streamResolutionScaleRatio: 100,
+      remoteResolution: remoteResolutionEnabled,
+      remoteResolutionWidth: .some(explicitRemoteWidth),
+      remoteResolutionHeight: .some(explicitRemoteHeight),
+      remoteFps: remoteFpsEnabled,
+      remoteFpsRate: .some(explicitRemoteFps),
+      codec: codec,
+      hdr: codec == 1 ? settings.hdr : false
+    )
 
     persist(updated, for: key)
   }

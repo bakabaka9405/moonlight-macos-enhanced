@@ -9,6 +9,7 @@
 #ifndef Limelight_Logger_h
 #define Limelight_Logger_h
 
+#import <Foundation/Foundation.h>
 #import <stdarg.h>
 
 typedef enum {
@@ -25,5 +26,9 @@ typedef enum {
 
 void Log(LogLevel level, NSString* fmt, ...);
 void LogTag(LogLevel level, NSString* tag, NSString* fmt, ...);
+void LoggerSetMinimumLevel(LogLevel level);
+LogLevel LoggerGetMinimumLevel(void);
+void LoggerSetCuratedModeEnabled(BOOL enabled);
+BOOL LoggerIsCuratedModeEnabled(void);
 
 #endif

@@ -35,6 +35,7 @@
 
 #import <IOKit/pwr_mgt/IOPMLib.h>
 #import <Carbon/Carbon.h>
+#include <arpa/inet.h>
 
 typedef NS_ENUM(NSInteger, PendingWindowMode) {
     PendingWindowModeNone,
@@ -42,7 +43,221 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     PendingWindowModeBorderless
 };
 
-@interface StreamViewController () <ConnectionCallbacks, KeyboardNotifiableDelegate, InputPresenceDelegate>
+static BOOL MLIsPrivateOrLocalIPv4String(NSString *ip) {
+    struct in_addr addr;
+    if (inet_pton(AF_INET, ip.UTF8String, &addr) != 1) {
+        return NO;
+    }
+
+    uint32_t host = ntohl(addr.s_addr);
+    if ((host & 0xFF000000) == 0x0A000000) return YES;        // 10.0.0.0/8
+    if ((host & 0xFFF00000) == 0xAC100000) return YES;        // 172.16.0.0/12
+    if ((host & 0xFFFF0000) == 0xC0A80000) return YES;        // 192.168.0.0/16
+    if ((host & 0xFFFF0000) == 0xA9FE0000) return YES;        // 169.254.0.0/16
+    if ((host & 0xFF000000) == 0x7F000000) return YES;        // 127.0.0.0/8
+    return NO;
+}
+
+static BOOL MLIsPrivateOrLocalIPv6String(NSString *ip) {
+    struct in6_addr addr6;
+    if (inet_pton(AF_INET6, ip.UTF8String, &addr6) != 1) {
+        return NO;
+    }
+
+    // ::1 loopback
+    BOOL isLoopback = YES;
+    for (int i = 0; i < 15; i++) {
+        if (addr6.s6_addr[i] != 0) {
+            isLoopback = NO;
+            break;
+        }
+    }
+    if (isLoopback && addr6.s6_addr[15] == 1) {
+        return YES;
+    }
+
+    // fe80::/10 link-local
+    if (addr6.s6_addr[0] == 0xFE && (addr6.s6_addr[1] & 0xC0) == 0x80) {
+        return YES;
+    }
+
+    // fc00::/7 unique local
+    if ((addr6.s6_addr[0] & 0xFE) == 0xFC) {
+        return YES;
+    }
+
+    return NO;
+}
+
+static BOOL MLIsIpLiteralString(NSString *host) {
+    if (host.length == 0) {
+        return NO;
+    }
+    struct in_addr addr4;
+    if (inet_pton(AF_INET, host.UTF8String, &addr4) == 1) {
+        return YES;
+    }
+    struct in6_addr addr6;
+    return inet_pton(AF_INET6, host.UTF8String, &addr6) == 1;
+}
+
+static BOOL MLShouldTreatAsKnownLocalHost(NSString *host) {
+    if (host.length == 0) {
+        return NO;
+    }
+    NSString *lower = host.lowercaseString;
+    if ([lower isEqualToString:@"localhost"] || [lower hasSuffix:@".local"]) {
+        return YES;
+    }
+    if (!MLIsIpLiteralString(host)) {
+        return NO;
+    }
+    return MLIsPrivateOrLocalIPv4String(host) || MLIsPrivateOrLocalIPv6String(host);
+}
+
+static NSString *MLDisconnectEventSummary(NSEvent *event) {
+    if (event == nil) {
+        return @"(null)";
+    }
+    NSString *chars = event.charactersIgnoringModifiers ?: @"";
+    NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    return [NSString stringWithFormat:@"type=%ld keyCode=%hu mods=0x%llx chars=%@ win=%ld",
+            (long)event.type,
+            event.keyCode,
+            (unsigned long long)mods,
+            chars,
+            (long)event.window.windowNumber];
+}
+
+static BOOL MLGetUsableRttInfo(PML_CONTROL_STREAM_CONTEXT controlCtx, uint32_t *rtt, uint32_t *rttVar) {
+    uint32_t currentRtt = 0;
+    uint32_t currentRttVar = 0;
+    if (controlCtx == NULL || !LiGetEstimatedRttInfoCtx(controlCtx, &currentRtt, &currentRttVar)) {
+        return NO;
+    }
+
+    if (currentRtt == 0 && currentRttVar == 0) {
+        return NO;
+    }
+
+    if (rtt != NULL) {
+        *rtt = currentRtt;
+    }
+    if (rttVar != NULL) {
+        *rttVar = currentRttVar;
+    }
+    return YES;
+}
+
+static NSString *MLRttLogSummary(PML_CONTROL_STREAM_CONTEXT controlCtx) {
+    uint32_t rtt = 0;
+    uint32_t rttVar = 0;
+    if (!MLGetUsableRttInfo(controlCtx, &rtt, &rttVar)) {
+        return @"n/a";
+    }
+
+    NSString *rttText = rtt == 0 ? @"<1" : [NSString stringWithFormat:@"%u", rtt];
+    NSString *rttVarText = rttVar == 0 ? @"<1" : [NSString stringWithFormat:@"%u", rttVar];
+    return [NSString stringWithFormat:@"%@/%@", rttText, rttVarText];
+}
+
+static const NSTimeInterval MLControlCenterRefreshIntervalSec = 0.5;
+static const NSTimeInterval MLStatsOverlayRefreshIntervalSec = 0.5;
+
+@protocol MLStreamScopedCallbackOwner <ConnectionCallbacks>
+- (BOOL)isActiveStreamGeneration:(NSUInteger)generation;
+@end
+
+@interface MLStreamScopedConnectionCallbacks : NSObject <ConnectionCallbacks>
+
+- (instancetype)initWithOwner:(id<MLStreamScopedCallbackOwner>)owner generation:(NSUInteger)generation;
+
+@end
+
+@implementation MLStreamScopedConnectionCallbacks {
+    __weak id<MLStreamScopedCallbackOwner> _owner;
+    NSUInteger _generation;
+}
+
+- (instancetype)initWithOwner:(id<MLStreamScopedCallbackOwner>)owner generation:(NSUInteger)generation {
+    self = [super init];
+    if (self) {
+        _owner = owner;
+        _generation = generation;
+    }
+    return self;
+}
+
+- (BOOL)forwardIfCurrentNamed:(NSString *)name block:(void (^)(id<MLStreamScopedCallbackOwner> owner))block {
+    id<MLStreamScopedCallbackOwner> owner = _owner;
+    if (!owner) {
+        return NO;
+    }
+    if (![owner isActiveStreamGeneration:_generation]) {
+        Log(LOG_I, @"[diag] Ignoring stale stream callback: %@ gen=%lu",
+            name ?: @"unknown",
+            (unsigned long)_generation);
+        return NO;
+    }
+    if (block) {
+        block(owner);
+    }
+    return YES;
+}
+
+- (void)connectionStarted {
+    [self forwardIfCurrentNamed:@"connectionStarted" block:^(id<MLStreamScopedCallbackOwner> owner) {
+        [owner connectionStarted];
+    }];
+}
+
+- (void)connectionTerminated:(int)errorCode {
+    [self forwardIfCurrentNamed:@"connectionTerminated" block:^(id<MLStreamScopedCallbackOwner> owner) {
+        [owner connectionTerminated:errorCode];
+    }];
+}
+
+- (void)stageStarting:(const char *)stageName {
+    [self forwardIfCurrentNamed:@"stageStarting" block:^(id<MLStreamScopedCallbackOwner> owner) {
+        [owner stageStarting:stageName];
+    }];
+}
+
+- (void)stageComplete:(const char *)stageName {
+    [self forwardIfCurrentNamed:@"stageComplete" block:^(id<MLStreamScopedCallbackOwner> owner) {
+        [owner stageComplete:stageName];
+    }];
+}
+
+- (void)stageFailed:(const char *)stageName withError:(int)errorCode {
+    [self forwardIfCurrentNamed:@"stageFailed" block:^(id<MLStreamScopedCallbackOwner> owner) {
+        [owner stageFailed:stageName withError:errorCode];
+    }];
+}
+
+- (void)launchFailed:(NSString *)message {
+    [self forwardIfCurrentNamed:@"launchFailed" block:^(id<MLStreamScopedCallbackOwner> owner) {
+        [owner launchFailed:message];
+    }];
+}
+
+- (void)rumble:(unsigned short)controllerNumber
+ lowFreqMotor:(unsigned short)lowFreqMotor
+highFreqMotor:(unsigned short)highFreqMotor {
+    [self forwardIfCurrentNamed:@"rumble" block:^(id<MLStreamScopedCallbackOwner> owner) {
+        [owner rumble:controllerNumber lowFreqMotor:lowFreqMotor highFreqMotor:highFreqMotor];
+    }];
+}
+
+- (void)connectionStatusUpdate:(int)status {
+    [self forwardIfCurrentNamed:@"connectionStatusUpdate" block:^(id<MLStreamScopedCallbackOwner> owner) {
+        [owner connectionStatusUpdate:status];
+    }];
+}
+
+@end
+
+@interface StreamViewController () <MLStreamScopedCallbackOwner, KeyboardNotifiableDelegate, InputPresenceDelegate>
 
 @property (nonatomic, strong) ControllerSupport *controllerSupport;
 @property (nonatomic, strong) HIDSupport *hidSupport;
@@ -62,6 +277,30 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 @property (nonatomic, strong) NSVisualEffectView *overlayContainer;
 @property (nonatomic, strong) NSTextField *overlayLabel;
 @property (nonatomic, strong) NSTimer *statsTimer;
+@property (nonatomic, strong) NSTimer *streamHealthTimer;
+@property (nonatomic) BOOL streamHealthSawPayload;
+@property (nonatomic) NSUInteger streamHealthNoPayloadStreak;
+@property (nonatomic) NSUInteger streamHealthNoDecodeStreak;
+@property (nonatomic) NSUInteger streamHealthNoRenderStreak;
+@property (nonatomic) NSUInteger streamHealthHighDropStreak;
+@property (nonatomic) NSUInteger streamHealthFrozenStatsStreak;
+@property (nonatomic) uint32_t streamHealthLastReceivedFrames;
+@property (nonatomic) uint32_t streamHealthLastDecodedFrames;
+@property (nonatomic) uint32_t streamHealthLastRenderedFrames;
+@property (nonatomic) uint32_t streamHealthLastTotalFrames;
+@property (nonatomic) uint64_t streamHealthLastReceivedBytes;
+@property (nonatomic) uint64_t streamHealthLastMitigationMs;
+@property (nonatomic) uint64_t streamHealthLastPayloadReconnectMs;
+@property (nonatomic) uint64_t streamHealthConnectionStartedMs;
+@property (nonatomic) NSInteger streamHealthMitigationStep;
+@property (nonatomic) int lastConnectionStatus;
+@property (nonatomic) NSUInteger connectionPoorStatusBurstCount;
+@property (nonatomic) uint64_t connectionPoorStatusBurstWindowStartMs;
+@property (nonatomic) uint64_t connectionLastIdrRequestMs;
+@property (nonatomic) NSInteger runtimeAutoBitrateCapKbps;
+@property (nonatomic) NSInteger runtimeAutoBitrateBaselineKbps;
+@property (nonatomic) NSUInteger runtimeAutoBitrateStableStreak;
+@property (nonatomic) uint64_t runtimeAutoBitrateLastRaiseMs;
 
 @property (nonatomic, strong) NSVisualEffectView *connectionWarningContainer;
 @property (nonatomic, strong) NSTextField *connectionWarningLabel;
@@ -75,6 +314,9 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 
 @property (nonatomic) BOOL disconnectWasUserInitiated;
 @property (nonatomic) uint64_t suppressConnectionWarningsUntilMs;
+@property (nonatomic, copy) NSString *pendingDisconnectSource;
+@property (nonatomic) uint64_t lastOptionUncaptureAtMs;
+@property (nonatomic) NSUInteger pendingOptionUncaptureToken;
 @property (nonatomic) BOOL isMouseCaptured;
 @property (nonatomic) BOOL isRemoteDesktopMode;
 @property (atomic) BOOL stopStreamInProgress;
@@ -82,6 +324,7 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 @property (nonatomic) BOOL shouldAttemptReconnect;
 @property (nonatomic) NSInteger reconnectAttemptCount;
 @property (nonatomic) BOOL reconnectInProgress;
+@property (atomic) NSUInteger activeStreamGeneration;
 
 @property (nonatomic) BOOL reconnectPreserveFullscreenStateValid;
 @property (nonatomic) NSInteger reconnectPreservedWindowMode;
@@ -108,6 +351,17 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 @property (nonatomic, strong) NSScrollView *logOverlayScrollView;
 @property (nonatomic, strong) NSTextView *logOverlayTextView;
 @property (nonatomic, strong) id logDidAppendObserver;
+@property (nonatomic, strong) NSMutableArray<NSString *> *logOverlayDisplayLines;
+@property (nonatomic, strong) NSMutableArray<NSString *> *logOverlayPausedRawLines;
+@property (nonatomic, copy) NSString *logOverlayLastFoldKey;
+@property (nonatomic, copy) NSString *logOverlayLastFoldBaseLine;
+@property (nonatomic) NSUInteger logOverlayLastFoldCount;
+@property (nonatomic) NSRange logOverlayLastRenderedRange;
+@property (nonatomic) BOOL logOverlayHasLastRenderedRange;
+@property (nonatomic) BOOL logOverlayPauseUpdates;
+@property (nonatomic) BOOL logOverlayAutoScrollEnabled;
+@property (nonatomic) NSUInteger logOverlaySoftMaxLines;
+@property (nonatomic) NSUInteger logOverlayTrimToLines;
 
 @property (nonatomic, strong) NSVisualEffectView *reconnectOverlayContainer;
 @property (nonatomic, strong) NSProgressIndicator *reconnectSpinner;
@@ -124,10 +378,13 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 @property (nonatomic, strong) NSButton *timeoutBitrateButton;
 @property (nonatomic, strong) NSButton *timeoutDisplayModeButton;
 @property (nonatomic, strong) NSButton *timeoutConnectionButton;
+@property (nonatomic, strong) NSButton *timeoutRecommendedProfileButton;
 @property (nonatomic, strong) NSButton *timeoutViewLogsButton;
 @property (nonatomic, strong) NSButton *timeoutCopyLogsButton;
+@property (nonatomic, strong) StreamRiskAssessment *currentStreamRiskAssessment;
 
 @property (nonatomic) NSInteger connectWatchdogToken;
+@property (nonatomic) uint64_t connectWatchdogStartMs;
 @property (nonatomic) BOOL didAutoReconnectAfterTimeout;
 
 @property (nonatomic, strong) id settingsDidChangeObserver;
@@ -240,6 +497,9 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     self.isMouseCaptured = NO;
     self.disconnectWasUserInitiated = NO;
     self.suppressConnectionWarningsUntilMs = 0;
+    self.pendingDisconnectSource = nil;
+    self.currentStreamRiskAssessment = nil;
+    self.lastOptionUncaptureAtMs = 0;
     self.stopStreamInProgress = NO;
     self.shouldAttemptReconnect = YES;
     self.reconnectAttemptCount = 0;
@@ -247,6 +507,22 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     self.connectWatchdogToken = 0;
     self.didAutoReconnectAfterTimeout = NO;
     self.streamOpQueue = [[NSOperationQueue alloc] init];
+    self.streamOpQueue.maxConcurrentOperationCount = 1;
+    self.streamHealthSawPayload = NO;
+    self.streamHealthNoPayloadStreak = 0;
+    self.streamHealthNoDecodeStreak = 0;
+    self.streamHealthNoRenderStreak = 0;
+    self.streamHealthHighDropStreak = 0;
+    self.streamHealthLastPayloadReconnectMs = 0;
+    self.streamHealthConnectionStartedMs = 0;
+    self.lastConnectionStatus = -1;
+    self.connectionPoorStatusBurstCount = 0;
+    self.connectionPoorStatusBurstWindowStartMs = 0;
+    self.connectionLastIdrRequestMs = 0;
+    self.runtimeAutoBitrateCapKbps = 0;
+    self.runtimeAutoBitrateBaselineKbps = 0;
+    self.runtimeAutoBitrateStableStreak = 0;
+    self.runtimeAutoBitrateLastRaiseMs = 0;
 
     self.hideFullscreenControlBall = [[NSUserDefaults standardUserDefaults] boolForKey:[self fullscreenControlBallDefaultsKey]];
     
@@ -353,21 +629,28 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 
 - (void)handleSessionDisconnectRequest:(NSNotification *)note {
     NSString *hostUUID = note.userInfo[@"hostUUID"];
+    NSNumber *quitApp = note.userInfo[@"quitApp"];
+    Log(LOG_I, @"[diag] Session disconnect request received: requestHost=%@ currentHost=%@ quitApp=%@ userInfo=%@",
+        hostUUID ?: @"(nil)",
+        self.app.host.uuid ?: @"(nil)",
+        quitApp != nil ? (quitApp.boolValue ? @"1" : @"0") : @"(nil)",
+        note.userInfo ?: @{});
+
     if (hostUUID && self.app.host.uuid && ![hostUUID isEqualToString:self.app.host.uuid]) {
         return;
     }
 
-    NSNumber *quitApp = note.userInfo[@"quitApp"];
     if (quitApp != nil) {
         if (quitApp.boolValue) {
             [self performCloseAndQuitApp:nil];
         } else {
-            [self performCloseStreamWindow:nil];
+            [self requestStreamCloseWithSource:@"session-manager-request"];
         }
         return;
     }
 
-    [self performClose:nil];
+    // Programmatic disconnect requests should not show a confirmation alert.
+    [self requestStreamCloseWithSource:@"session-manager-request-legacy"];
 }
 
 - (BOOL)hasReceivedAnyVideoFrames {
@@ -375,7 +658,24 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
         if (!self.streamMan) {
             return NO;
         }
-        return self.streamMan.connection.renderer.videoStats.receivedFrames > 0;
+        VideoStats stats = self.streamMan.connection.renderer.videoStats;
+        uint64_t nowStatsMs = LiGetMillis();
+        BOOL statsTimestampValid = (stats.lastUpdatedTimestamp > 0 && nowStatsMs >= stats.lastUpdatedTimestamp);
+        uint64_t statsAgeMs = statsTimestampValid ? (nowStatsMs - stats.lastUpdatedTimestamp) : UINT64_MAX;
+        BOOL statsFresh = statsTimestampValid && statsAgeMs <= 2000;
+        BOOL hasPayloadInWindow = (stats.receivedFrames > 0 || stats.receivedBytes > 0 || stats.receivedFps > 0.1f);
+        BOOL hasFreshPayload = (statsFresh || !statsTimestampValid) && hasPayloadInWindow;
+
+        if (hasFreshPayload) {
+            return YES;
+        }
+        if (self.streamHealthSawPayload) {
+            return YES;
+        }
+        if (self.streamHealthLastReceivedFrames > 0 || self.streamHealthLastReceivedBytes > 0) {
+            return YES;
+        }
+        return NO;
     } @catch (NSException *ex) {
         return NO;
     }
@@ -383,10 +683,14 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 
 - (void)startConnectWatchdog {
     self.connectWatchdogToken += 1;
+    self.connectWatchdogStartMs = [self nowMs];
     NSInteger token = self.connectWatchdogToken;
+    [self scheduleConnectWatchdogCheckForToken:token delay:15.0];
+}
 
+- (void)scheduleConnectWatchdogCheckForToken:(NSInteger)token delay:(NSTimeInterval)delay {
     __weak typeof(self) weakSelf = self;
-    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10.0 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(delay * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         __strong typeof(self) strongSelf = weakSelf;
         if (!strongSelf) {
             return;
@@ -403,6 +707,32 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
         if (strongSelf.timeoutOverlayContainer) {
             return;
         }
+
+        uint64_t nowMs = [strongSelf nowMs];
+        uint64_t elapsedMs = (strongSelf.connectWatchdogStartMs > 0 && nowMs >= strongSelf.connectWatchdogStartMs)
+            ? (nowMs - strongSelf.connectWatchdogStartMs)
+            : 0;
+        BOOL connectionObjectReady = strongSelf.streamMan != nil && strongSelf.streamMan.connection != nil;
+
+        // Don't treat a slow /launch or /resume as a dead stream. Until the Connection
+        // object exists, we haven't even entered RTSP/video startup yet, so reconnecting
+        // here just kills a still-starting session and often makes the second attempt fail.
+        static const uint64_t kPreConnectionGraceMs = 45000;
+        static const NSTimeInterval kPreConnectionPollIntervalSec = 5.0;
+        if (!connectionObjectReady) {
+            if (elapsedMs < kPreConnectionGraceMs) {
+                Log(LOG_I, @"[diag] Connect watchdog deferred: still waiting for host launch/resume (elapsed=%.1fs)",
+                    elapsedMs / 1000.0);
+                [strongSelf scheduleConnectWatchdogCheckForToken:token delay:kPreConnectionPollIntervalSec];
+                return;
+            }
+
+            NSString *timeoutMessage = @"主机仍在启动或恢复串流，会比视频阶段慢很多。\n可继续等待，或手动重连 / 返回后重新进入。";
+            [strongSelf showErrorOverlayWithTitle:@"主机启动较慢"
+                                          message:timeoutMessage
+                                          canWait:YES];
+            return;
+        }
         
         // If we are stuck in reconnecting state for > 10s, force error overlay
         if (strongSelf.reconnectInProgress) {
@@ -414,16 +744,21 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
             return;
         }
 
-        // 10s with no frames: attempt a single auto-reconnect (once per stream VC lifetime), then show timeout UI.
-        if (!strongSelf.didAutoReconnectAfterTimeout && strongSelf.shouldAttemptReconnect) {
+        // 15s with no frames: auto mode attempts a single reconnect; manual expert mode surfaces diagnostics only.
+        if (!strongSelf.didAutoReconnectAfterTimeout &&
+            strongSelf.shouldAttemptReconnect &&
+            [strongSelf isAutomaticRecoveryModeEnabled]) {
             strongSelf.didAutoReconnectAfterTimeout = YES;
             [strongSelf showReconnectOverlayWithMessage:@"网络无响应，正在尝试重连…"]; 
             [strongSelf attemptReconnectWithReason:@"connect-timeout-auto"]; 
             return;
         }
 
+        NSString *timeoutMessage = [strongSelf isAutomaticRecoveryModeEnabled]
+            ? @"已持续 15 秒未接收到视频数据。\n请检查网络连接或尝试以下操作。"
+            : @"已持续 15 秒未接收到视频数据。\n手动档不会静默改你的参数，可继续等待、手动重连，或套用推荐档位。";
         [strongSelf showErrorOverlayWithTitle:@"连接不稳定或无画面"
-                                      message:@"已持续 10 秒未接收到视频数据。\n请检查网络连接或尝试以下操作。"
+                                      message:timeoutMessage
                                       canWait:YES];
     });
 }
@@ -539,6 +874,7 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
         NSButton *bitrateBtn = createSettingsBtn(@"码率", @"speedometer", @selector(handleTimeoutBitrate:));
         NSButton *displayModeBtn = createSettingsBtn(@"显示模式", @"macwindow", @selector(handleTimeoutDisplayMode:));
         NSButton *connBtn = createSettingsBtn(@"连接方式", @"network", @selector(handleTimeoutConnection:));
+        NSButton *recommendedBtn = createSettingsBtn(@"推荐档位", @"sparkles", @selector(handleTimeoutRecommendedProfile:));
 
         // --- Log Tools - 改进样式，使用图标按钮 ---
         
@@ -586,6 +922,7 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
         self.timeoutBitrateButton = bitrateBtn;
         self.timeoutDisplayModeButton = displayModeBtn;
         self.timeoutConnectionButton = connBtn;
+        self.timeoutRecommendedProfileButton = recommendedBtn;
         self.timeoutViewLogsButton = viewLogBtn;
         self.timeoutCopyLogsButton = copyLogBtn;
 
@@ -599,6 +936,7 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
         [container addSubview:bitrateBtn];
         [container addSubview:displayModeBtn];
         [container addSubview:connBtn];
+        [container addSubview:recommendedBtn];
         [container addSubview:viewLogBtn];
         [container addSubview:copyLogBtn];
 
@@ -615,6 +953,10 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     self.timeoutTitleLabel.stringValue = title ?: @"连接异常";
     self.timeoutLabel.stringValue = message ?: @"未知错误";
     self.timeoutWaitButton.hidden = !canWait;
+    BOOL showRecommendedProfile = self.currentStreamRiskAssessment != nil &&
+                                  self.currentStreamRiskAssessment.manualExpertMode &&
+                                  self.currentStreamRiskAssessment.recommendedFallbacks.count > 0;
+    self.timeoutRecommendedProfileButton.hidden = !showRecommendedProfile;
 
     [self viewDidLayout];
 }
@@ -636,6 +978,7 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     self.timeoutBitrateButton = nil;
     self.timeoutDisplayModeButton = nil;
     self.timeoutConnectionButton = nil;
+    self.timeoutRecommendedProfileButton = nil;
     self.timeoutViewLogsButton = nil;
     self.timeoutCopyLogsButton = nil;
 
@@ -648,6 +991,12 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 }
 
 - (void)handleTimeoutReconnect:(id)sender {
+    if (self.reconnectInProgress || self.stopStreamInProgress) {
+        Log(LOG_W, @"[diag] Reconnect button ignored: reconnectInProgress=%d stopInProgress=%d",
+            self.reconnectInProgress ? 1 : 0,
+            self.stopStreamInProgress ? 1 : 0);
+        return;
+    }
     [self hideConnectionTimeoutOverlay];
     [self attemptReconnectWithReason:@"timeout-overlay-manual"];
 }
@@ -657,7 +1006,7 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 }
 
 - (void)handleTimeoutExitStream:(id)sender {
-    [self performCloseStreamWindow:sender];
+    [self requestStreamCloseWithSource:@"timeout-overlay-exit"];
 }
 
 - (void)handleTimeoutResolution:(id)sender {
@@ -754,6 +1103,61 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     }
 }
 
+- (void)handleTimeoutRecommendedProfile:(id)sender {
+    NSArray<StreamRiskRecommendation *> *recommendations = self.currentStreamRiskAssessment.recommendedFallbacks;
+    if (recommendations.count == 0) {
+        return;
+    }
+
+    NSMenu *menu = [[NSMenu alloc] initWithTitle:@"RecommendedProfiles"];
+    for (StreamRiskRecommendation *recommendation in recommendations) {
+        NSMenuItem *item = [[NSMenuItem alloc] initWithTitle:recommendation.summaryLine action:@selector(handleRecommendedProfileSelection:) keyEquivalent:@""];
+        item.target = self;
+        item.representedObject = recommendation;
+        [menu addItem:item];
+    }
+
+    NSButton *btn = (NSButton *)sender;
+    NSPoint p = NSMakePoint(0, btn.bounds.size.height + 5);
+    [menu popUpMenuPositioningItem:nil atLocation:p inView:btn];
+}
+
+- (void)handleRecommendedProfileSelection:(NSMenuItem *)item {
+    StreamRiskRecommendation *recommendation = item.representedObject;
+    if (recommendation == nil) {
+        return;
+    }
+
+    [SettingsClass applyStreamRecommendation:recommendation for:self.app.host.uuid];
+    [SettingsClass loadMoonlightSettingsFor:self.app.host.uuid];
+    [self hideConnectionTimeoutOverlay];
+    [self attemptReconnectWithReason:@"risk-recommended-profile"];
+}
+
+- (BOOL)isAutomaticRecoveryModeEnabled {
+    NSDictionary *prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
+    return prefs ? [prefs[@"autoAdjustBitrate"] boolValue] : YES;
+}
+
+- (void)presentManualRiskOverlayForReason:(NSString *)reason {
+    if (self.timeoutOverlayContainer || self.reconnectInProgress || self.stopStreamInProgress) {
+        return;
+    }
+
+    NSMutableString *message = [NSMutableString stringWithString:@"手动档不会静默改你的分辨率/FPS/444/codec。"];
+    if (self.currentStreamRiskAssessment.summaryLine.length > 0) {
+        [message appendFormat:@"\n当前评估：%@", self.currentStreamRiskAssessment.summaryLine];
+    }
+    if (self.currentStreamRiskAssessment.recommendedFallbacks.count > 0) {
+        [message appendString:@"\n可直接套用推荐档位，或继续等待 / 手动重连。"];
+    } else {
+        [message appendString:@"\n可继续等待或手动重连。"];
+    }
+
+    Log(LOG_W, @"[diag] Manual expert mode holds parameters on %@", reason ?: @"(unknown)");
+    [self showErrorOverlayWithTitle:@"检测到持续卡顿" message:message canWait:YES];
+}
+
 - (void)handleTimeoutViewLogs:(id)sender {
     [self toggleLogOverlay];
 }
@@ -771,7 +1175,11 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
             return;
         }
         self.stopStreamInProgress = YES;
+        self.activeStreamGeneration += 1;
     }
+
+    [self stopStreamHealthDiagnostics];
+    [self logStreamHealthSummaryWithReason:[NSString stringWithFormat:@"begin-stop:%@", reason ?: @"unknown"]];
 
     self.hidSupport.shouldSendInputEvents = NO;
     self.controllerSupport.shouldSendInputEvents = NO;
@@ -940,7 +1348,8 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
             return [NSString stringWithFormat:@"%@ (%@)", addr, MLString(@"Offline", nil)];
         }
         if (latency && latency.intValue >= 0) {
-            return [NSString stringWithFormat:@"%@ (%dms)", addr, latency.intValue];
+            NSString *latencyText = [self formattedLatencyTextForDisplay:latency];
+            return [NSString stringWithFormat:@"%@ (%@)", addr, latencyText ?: MLString(@"Online", nil)];
         }
         return addr;
     };
@@ -988,6 +1397,11 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     if (self.controlCenterTimer) {
         [self.controlCenterTimer invalidate];
         self.controlCenterTimer = nil;
+    }
+
+    if (self.streamHealthTimer) {
+        [self.streamHealthTimer invalidate];
+        self.streamHealthTimer = nil;
     }
 
     if (self.localKeyDownMonitor) {
@@ -1039,6 +1453,7 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 
         // Escape hatch: Ctrl+Alt+Cmd+B toggles borderless <-> windowed.
         if (event.keyCode == kVK_ANSI_B && mods == (NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand)) {
+            strongSelf.pendingOptionUncaptureToken += 1;
             if ([strongSelf isWindowBorderlessMode]) {
                 [strongSelf switchToWindowedMode:nil];
             } else {
@@ -1050,6 +1465,7 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
         // Ctrl+Option+C opens the control center in borderless/fullscreen mode
         if (event.keyCode == kVK_ANSI_C && mods == (NSEventModifierFlagControl | NSEventModifierFlagOption)) {
             if ([strongSelf isWindowBorderlessMode] || [strongSelf isWindowFullscreen]) {
+                strongSelf.pendingOptionUncaptureToken += 1;
                 [strongSelf presentStreamMenuFromView:strongSelf.view];
                 return nil;
             }
@@ -1099,14 +1515,42 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 
 - (void)flagsChanged:(NSEvent *)event {
     [self.hidSupport flagsChanged:event];
-    
-    // Uncapture mouse when Option key is pressed
+
     if ((event.keyCode == kVK_Option || event.keyCode == kVK_RightOption) &&
         (event.modifierFlags & NSEventModifierFlagOption)) {
+        NSEventModifierFlags relevantMods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+        BOOL hasControl = (relevantMods & NSEventModifierFlagControl) != 0;
+
+        if (hasControl) {
+            NSUInteger token = ++self.pendingOptionUncaptureToken;
+            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+                if (token != self.pendingOptionUncaptureToken) {
+                    return;
+                }
+
+                NSEventModifierFlags currentMods = [NSEvent modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
+                BOOL optionStillHeld = (currentMods & NSEventModifierFlagOption) != 0;
+                BOOL controlStillHeld = (currentMods & NSEventModifierFlagControl) != 0;
+                if (!optionStillHeld || !controlStillHeld) {
+                    return;
+                }
+
+                self.lastOptionUncaptureAtMs = [self nowMs];
+                [self.hidSupport releaseAllModifierKeys];
+                [self suppressConnectionWarningsForSeconds:2.0 reason:@"option-uncapture"];
+                [self uncaptureMouse];
+            });
+            return;
+        }
+
+        self.pendingOptionUncaptureToken += 1;
+        self.lastOptionUncaptureAtMs = [self nowMs];
         [self.hidSupport releaseAllModifierKeys];
         // User is intentionally detaching local input/cursor; suppress transient connection warnings.
-        [self suppressConnectionWarningsForSeconds:2.0 reason:@"option-uncapture"]; 
+        [self suppressConnectionWarningsForSeconds:2.0 reason:@"option-uncapture"];
         [self uncaptureMouse];
+    } else if (!(event.modifierFlags & NSEventModifierFlagOption)) {
+        self.pendingOptionUncaptureToken += 1;
     }
 }
 
@@ -1223,26 +1667,34 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     
     if ((event.keyCode == kVK_ANSI_F && eventModifierFlags == (NSEventModifierFlagControl | NSEventModifierFlagCommand))
         || (event.keyCode == kVK_ANSI_F && eventModifierFlags == NSEventModifierFlagFunction)
-        || (event.keyCode == kVK_ANSI_W && eventModifierFlags == (NSEventModifierFlagOption | NSEventModifierFlagControl))
-        || (event.keyCode == kVK_ANSI_W && eventModifierFlags == (NSEventModifierFlagShift | NSEventModifierFlagControl))
         || (event.keyCode == kVK_ANSI_W && eventModifierFlags == NSEventModifierFlagCommand)
         ) {
         [self.hidSupport releaseAllModifierKeys];
         return NO;
     }
+
+    if (event.keyCode == kVK_ANSI_W && eventModifierFlags == (NSEventModifierFlagOption | NSEventModifierFlagControl)) {
+        self.pendingOptionUncaptureToken += 1;
+        [self.hidSupport releaseAllModifierKeys];
+        [self requestStreamCloseWithSource:@"keyboard-ctrl-option-w"];
+        return YES;
+    }
     
     if (event.keyCode == kVK_ANSI_S && eventModifierFlags == (NSEventModifierFlagControl | NSEventModifierFlagOption)) {
+        self.pendingOptionUncaptureToken += 1;
         [self toggleOverlay];
         return YES;
     }
 
     if (event.keyCode == kVK_ANSI_M && eventModifierFlags == (NSEventModifierFlagControl | NSEventModifierFlagOption)) {
+        self.pendingOptionUncaptureToken += 1;
         [self toggleMouseMode];
         return YES;
     }
 
     // Ctrl+Alt+G: toggle fullscreen floating control ball
     if (event.keyCode == kVK_ANSI_G && eventModifierFlags == (NSEventModifierFlagControl | NSEventModifierFlagOption)) {
+        self.pendingOptionUncaptureToken += 1;
         [self toggleFullscreenControlBallVisibility];
         return YES;
     }
@@ -1258,6 +1710,9 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 
 
 - (IBAction)performClose:(id)sender {
+    Log(LOG_I, @"[diag] performClose invoked: sender=%@ event=%@",
+        sender ? NSStringFromClass([sender class]) : @"(null)",
+        MLDisconnectEventSummary(NSApp.currentEvent));
     [self uncaptureMouse];
     
     NSAlert *alert = [[NSAlert alloc] init];
@@ -1272,6 +1727,7 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     [alert beginSheetModalForWindow:self.view.window completionHandler:^(NSModalResponse returnCode) {
         switch (returnCode) {
             case NSAlertFirstButtonReturn:
+                self.pendingDisconnectSource = @"disconnect-alert-confirmed";
                 [self doCommandBySelector:@selector(performCloseStreamWindow:)];
                 break;
                 
@@ -1288,6 +1744,14 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 
 - (IBAction)performCloseStreamWindow:(id)sender {
     [self.hidSupport releaseAllModifierKeys];
+    NSString *disconnectSource = [self resolvedDisconnectSourceFromSender:sender];
+    Log(LOG_W, @"[diag] Disconnect requested: source=%@ sender=%@ captured=%d reconnect=%d stopInProgress=%d",
+        disconnectSource,
+        sender ? NSStringFromClass([sender class]) : @"(null)",
+        self.isMouseCaptured ? 1 : 0,
+        self.reconnectInProgress ? 1 : 0,
+        self.stopStreamInProgress ? 1 : 0);
+    [self logStreamHealthSummaryWithReason:[NSString stringWithFormat:@"disconnect-request:%@", disconnectSource]];
 
     // In borderless/floating mode, relying on the responder chain can fail to close the window,
     // leaving the last frame stuck. Restore a normal window style and close explicitly.
@@ -1395,7 +1859,13 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     if (self.controlCenterTimer) {
         return;
     }
-    self.controlCenterTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(updateControlCenterStatus) userInfo:nil repeats:YES];
+    self.controlCenterTimer = [NSTimer timerWithTimeInterval:MLControlCenterRefreshIntervalSec
+                                                      target:self
+                                                    selector:@selector(updateControlCenterStatus)
+                                                    userInfo:nil
+                                                     repeats:YES];
+    self.controlCenterTimer.tolerance = 0.1;
+    [[NSRunLoop mainRunLoop] addTimer:self.controlCenterTimer forMode:NSRunLoopCommonModes];
     [self updateControlCenterStatus];
 }
 
@@ -1462,14 +1932,45 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     return bestAddr;
 }
 
+- (BOOL)isActiveStreamGeneration:(NSUInteger)generation {
+    return generation != 0 && generation == self.activeStreamGeneration;
+}
+
+- (NSString *)formattedLatencyTextForDisplay:(NSNumber *)latencyNumber {
+    if (latencyNumber == nil || latencyNumber.integerValue < 0) {
+        return nil;
+    }
+
+    NSInteger latencyMs = MAX(1, latencyNumber.integerValue);
+    return [NSString stringWithFormat:@"%ldms", (long)latencyMs];
+}
+
+- (NSString *)currentLatencyLogSummary {
+    PML_CONTROL_STREAM_CONTEXT controlCtx = self.streamMan.connection ? (PML_CONTROL_STREAM_CONTEXT)[self.streamMan.connection controlStreamContext] : NULL;
+    NSString *controlSummary = MLRttLogSummary(controlCtx);
+    if (![controlSummary isEqualToString:@"n/a"]) {
+        return controlSummary;
+    }
+
+    NSString *addr = [self currentPreferredAddressForStatus];
+    NSNumber *latency = addr ? self.app.host.addressLatencies[addr] : nil;
+    if (latency != nil && latency.integerValue >= 0) {
+        NSInteger pathProbeMs = MAX(1, latency.integerValue);
+        NSString *pathText = [NSString stringWithFormat:@"%ld", (long)pathProbeMs];
+        return [NSString stringWithFormat:@"probe~%@", pathText];
+    }
+
+    return @"n/a";
+}
+
 - (NSInteger)currentLatencyMs {
     // If we are actively streaming, use the real-time RTT.
     if ([self hasReceivedAnyVideoFrames]) {
         uint32_t rtt = 0;
         uint32_t rttVar = 0;
         PML_CONTROL_STREAM_CONTEXT controlCtx = self.streamMan.connection ? (PML_CONTROL_STREAM_CONTEXT)[self.streamMan.connection controlStreamContext] : NULL;
-        if (controlCtx && LiGetEstimatedRttInfoCtx(controlCtx, &rtt, &rttVar)) {
-            return (NSInteger)rtt;
+        if (MLGetUsableRttInfo(controlCtx, &rtt, &rttVar)) {
+            return (NSInteger)MAX((uint32_t)1, rtt);
         }
     }
 
@@ -1478,7 +1979,17 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
     if (!latency) {
         return -1;
     }
-    return latency.integerValue;
+    return MAX(1, latency.integerValue);
+}
+
+- (NSString *)currentStreamHealthBadgeText {
+    if (self.streamHealthNoPayloadStreak > 0) {
+        return [NSString stringWithFormat:@"卡住%lus", (unsigned long)self.streamHealthNoPayloadStreak];
+    }
+    if (self.streamHealthHighDropStreak >= 2) {
+        return @"高丢包";
+    }
+    return @"控制中心";
 }
 
 - (void)updateControlCenterStatus {
@@ -1491,7 +2002,9 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
 
     NSInteger latency = [self currentLatencyMs];
     NSString *symbol = @"wifi";
-    if (latency < 0) {
+    if (self.streamHealthNoPayloadStreak >= 2 || self.streamHealthFrozenStatsStreak >= 2) {
+        symbol = @"wifi.exclamationmark";
+    } else if (latency < 0) {
         symbol = @"wifi.slash";
     } else if (latency <= 30) {
         symbol = @"cellularbars";
@@ -1509,6 +2022,10 @@ typedef NS_ENUM(NSInteger, PendingWindowMode) {
             img = [NSImage imageWithSystemSymbolName:@"wifi" accessibilityDescription:nil];
         }
         self.controlCenterSignalImageView.image = img;
+    }
+
+    if (self.controlCenterTitleLabel) {
+        self.controlCenterTitleLabel.stringValue = [self currentStreamHealthBadgeText];
     }
 }
 
@@ -2832,6 +3349,475 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     return (uint64_t)(CACurrentMediaTime() * 1000.0);
 }
 
+- (void)resetStreamHealthDiagnostics {
+    self.streamHealthSawPayload = NO;
+    self.streamHealthNoPayloadStreak = 0;
+    self.streamHealthNoDecodeStreak = 0;
+    self.streamHealthNoRenderStreak = 0;
+    self.streamHealthHighDropStreak = 0;
+    self.streamHealthFrozenStatsStreak = 0;
+    self.streamHealthLastReceivedFrames = 0;
+    self.streamHealthLastDecodedFrames = 0;
+    self.streamHealthLastRenderedFrames = 0;
+    self.streamHealthLastTotalFrames = 0;
+    self.streamHealthLastReceivedBytes = 0;
+    self.streamHealthLastMitigationMs = 0;
+    self.streamHealthLastPayloadReconnectMs = 0;
+    self.streamHealthConnectionStartedMs = 0;
+    self.streamHealthMitigationStep = 0;
+    self.runtimeAutoBitrateStableStreak = 0;
+}
+
+- (void)stopStreamHealthDiagnostics {
+    if (self.streamHealthTimer) {
+        [self.streamHealthTimer invalidate];
+        self.streamHealthTimer = nil;
+    }
+}
+
+- (void)startStreamHealthDiagnostics {
+    [self stopStreamHealthDiagnostics];
+    [self resetStreamHealthDiagnostics];
+    self.streamHealthTimer = [NSTimer timerWithTimeInterval:1.0
+                                                     target:self
+                                                   selector:@selector(pollStreamHealthDiagnostics:)
+                                                   userInfo:nil
+                                                    repeats:YES];
+    [[NSRunLoop mainRunLoop] addTimer:self.streamHealthTimer forMode:NSRunLoopCommonModes];
+}
+
+- (void)attemptAdaptiveMitigationForDropRate:(float)dropRate {
+    if (self.stopStreamInProgress || self.reconnectInProgress || !self.shouldAttemptReconnect) {
+        return;
+    }
+
+    uint64_t nowMs = [self nowMs];
+    // Avoid repeatedly restarting in short intervals during unstable tunnels.
+    if (self.streamHealthLastMitigationMs > 0 && nowMs - self.streamHealthLastMitigationMs < 20000) {
+        return;
+    }
+
+    NSDictionary *prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
+    BOOL autoAdjustBitrate = prefs ? [prefs[@"autoAdjustBitrate"] boolValue] : NO;
+    if (!autoAdjustBitrate) {
+        Log(LOG_I, @"[diag] Adaptive mitigation skipped: auto bitrate disabled (drop=%.1f%%)", dropRate);
+        return;
+    }
+
+    BOOL routeIsTunnel = NO;
+    if (self.app.host.activeAddress.length > 0) {
+        routeIsTunnel = [Utils isTunnelInterfaceName:[Utils outboundInterfaceNameForAddress:self.app.host.activeAddress sourceAddress:nil]];
+    }
+    if (!routeIsTunnel) {
+        return;
+    }
+
+    DataManager *dataMan = [[DataManager alloc] init];
+    TemporarySettings *tempSettings = [dataMan getSettings];
+    int currentBitrate = [tempSettings.bitrate intValue];
+    if (self.runtimeAutoBitrateBaselineKbps > 0 && currentBitrate <= 0) {
+        currentBitrate = (int)self.runtimeAutoBitrateBaselineKbps;
+    }
+    if (currentBitrate <= 0) {
+        currentBitrate = 10000;
+    }
+    if (self.runtimeAutoBitrateCapKbps > 0 && self.runtimeAutoBitrateCapKbps < currentBitrate) {
+        currentBitrate = (int)self.runtimeAutoBitrateCapKbps;
+    }
+
+    int newBitrate = MAX(6000, (int)((double)currentBitrate * 0.80 + 0.5));
+
+    // If we're already at the floor, avoid reconnect loops.
+    if (newBitrate >= currentBitrate) {
+        return;
+    }
+
+    self.runtimeAutoBitrateCapKbps = newBitrate;
+    self.runtimeAutoBitrateStableStreak = 0;
+    self.streamHealthLastMitigationMs = nowMs;
+    self.streamHealthMitigationStep += 1;
+
+    Log(LOG_W, @"[diag] Adaptive mitigation #%ld applied for tunnel drop=%.1f%%: bitrate %d->%d kbps (fps unchanged by design)",
+        (long)self.streamHealthMitigationStep,
+        dropRate,
+        currentBitrate,
+        newBitrate);
+
+    [self attemptReconnectWithReason:@"adaptive-drop-mitigation"];
+}
+
+- (void)pollStreamHealthDiagnostics:(NSTimer *)timer {
+    (void)timer;
+    if (!self.streamMan || !self.streamMan.connection || !self.streamMan.connection.renderer) {
+        return;
+    }
+
+    VideoStats stats = self.streamMan.connection.renderer.videoStats;
+    uint64_t nowMs = [self nowMs];
+    uint64_t nowStatsMs = LiGetMillis();
+    BOOL statsTimestampValid = (stats.lastUpdatedTimestamp > 0 && nowStatsMs >= stats.lastUpdatedTimestamp);
+    uint64_t statsAgeMs = statsTimestampValid ? (nowStatsMs - stats.lastUpdatedTimestamp) : UINT64_MAX;
+    BOOL statsFresh = statsTimestampValid && statsAgeMs <= 1500;
+    BOOL hasPayloadInWindow = (stats.receivedBytes > 0 || stats.receivedFrames > 0 || stats.receivedFps > 0.1f);
+    BOOL hasProgressSinceLast = (stats.receivedFrames != self.streamHealthLastReceivedFrames ||
+                                 stats.decodedFrames != self.streamHealthLastDecodedFrames ||
+                                 stats.renderedFrames != self.streamHealthLastRenderedFrames ||
+                                 stats.totalFrames != self.streamHealthLastTotalFrames ||
+                                 stats.receivedBytes != self.streamHealthLastReceivedBytes);
+    BOOL hasPayloadInFreshWindow = (statsFresh || !statsTimestampValid) && hasPayloadInWindow;
+
+    if (hasPayloadInFreshWindow || hasProgressSinceLast) {
+        self.streamHealthSawPayload = YES;
+    }
+
+    if (self.streamHealthSawPayload && !hasProgressSinceLast) {
+        self.streamHealthNoPayloadStreak += 1;
+    } else {
+        self.streamHealthNoPayloadStreak = 0;
+    }
+
+    BOOL staleByTimestamp = statsTimestampValid && !statsFresh;
+    BOOL staleByNoProgress = self.streamHealthSawPayload && !hasProgressSinceLast;
+    if (staleByTimestamp || staleByNoProgress) {
+        self.streamHealthFrozenStatsStreak += 1;
+    } else {
+        self.streamHealthFrozenStatsStreak = 0;
+    }
+
+    if ((hasPayloadInWindow || hasProgressSinceLast) && stats.decodedFrames == 0) {
+        self.streamHealthNoDecodeStreak += 1;
+    } else {
+        self.streamHealthNoDecodeStreak = 0;
+    }
+
+    if (stats.decodedFrames > 0 && stats.renderedFrames == 0) {
+        self.streamHealthNoRenderStreak += 1;
+    } else {
+        self.streamHealthNoRenderStreak = 0;
+    }
+
+    float dropRate = 0.0f;
+    if (stats.totalFrames > 0) {
+        dropRate = (float)stats.networkDroppedFrames * 100.0f / (float)stats.totalFrames;
+    }
+    if (stats.totalFrames >= 30 && dropRate >= 25.0f) {
+        self.streamHealthHighDropStreak += 1;
+    } else {
+        self.streamHealthHighDropStreak = 0;
+    }
+
+    NSString *rttLogText = [self currentLatencyLogSummary];
+
+    BOOL autoRecoveryMode = [self isAutomaticRecoveryModeEnabled];
+
+    if (self.streamHealthNoPayloadStreak == 3 || (self.streamHealthNoPayloadStreak > 3 && self.streamHealthNoPayloadStreak % 5 == 0)) {
+        Log(LOG_W, @"[diag] Video payload stalled for %lus (possible freeze/static/no-input). rf=%u df=%u ren=%u bytes=%llu jitter=%.2fms rtt=%@ ageMs=%llu fresh=%d captured=%d input=%d",
+            (unsigned long)self.streamHealthNoPayloadStreak,
+            stats.receivedFrames,
+            stats.decodedFrames,
+            stats.renderedFrames,
+            (unsigned long long)stats.receivedBytes,
+            stats.jitterMs,
+            rttLogText,
+            (unsigned long long)(statsTimestampValid ? statsAgeMs : 0),
+            statsFresh ? 1 : 0,
+            self.isMouseCaptured ? 1 : 0,
+            self.hidSupport.shouldSendInputEvents ? 1 : 0);
+    }
+
+    static const NSUInteger kPayloadStallIdrThreshold = 2;
+    static const uint64_t kPayloadStallIdrIntervalMs = 2000;
+    static const NSUInteger kPayloadStallReconnectThreshold = 5;
+    static const uint64_t kPayloadStallReconnectCooldownMs = 10000;
+    static const uint64_t kStartupNoPayloadReconnectThresholdMs = 6000;
+
+    if (!self.streamHealthSawPayload &&
+        self.streamHealthConnectionStartedMs > 0 &&
+        nowMs >= self.streamHealthConnectionStartedMs) {
+        uint64_t startupNoPayloadMs = nowMs - self.streamHealthConnectionStartedMs;
+        if (startupNoPayloadMs >= kStartupNoPayloadReconnectThresholdMs &&
+            self.shouldAttemptReconnect &&
+            !self.reconnectInProgress &&
+            !self.stopStreamInProgress &&
+            (self.streamHealthLastPayloadReconnectMs == 0 || nowMs - self.streamHealthLastPayloadReconnectMs >= kPayloadStallReconnectCooldownMs)) {
+            if (autoRecoveryMode) {
+                self.streamHealthLastPayloadReconnectMs = nowMs;
+                Log(LOG_W, @"[diag] No video payload %.1fs after connection start, attempting reconnect",
+                    startupNoPayloadMs / 1000.0);
+                [self attemptReconnectWithReason:@"startup-no-payload-reconnect"];
+            } else {
+                Log(LOG_W, @"[diag] No video payload %.1fs after connection start, manual expert mode keeps stream parameters",
+                    startupNoPayloadMs / 1000.0);
+                [self presentManualRiskOverlayForReason:@"startup-no-payload"];
+            }
+        }
+    }
+
+    if (self.streamHealthNoPayloadStreak >= kPayloadStallIdrThreshold &&
+        (self.connectionLastIdrRequestMs == 0 || nowMs - self.connectionLastIdrRequestMs > kPayloadStallIdrIntervalMs)) {
+        LiRequestIdrFrame();
+        self.connectionLastIdrRequestMs = nowMs;
+        Log(LOG_I, @"[diag] Requested IDR on payload-stall streak=%lu", (unsigned long)self.streamHealthNoPayloadStreak);
+    }
+
+    if (self.streamHealthNoPayloadStreak >= kPayloadStallReconnectThreshold &&
+        self.shouldAttemptReconnect &&
+        !self.reconnectInProgress &&
+        !self.stopStreamInProgress &&
+        (self.streamHealthLastPayloadReconnectMs == 0 || nowMs - self.streamHealthLastPayloadReconnectMs >= kPayloadStallReconnectCooldownMs)) {
+        if (autoRecoveryMode) {
+            self.streamHealthLastPayloadReconnectMs = nowMs;
+            Log(LOG_W, @"[diag] Persistent payload stall (%lus >= %lu) detected, attempting reconnect",
+                (unsigned long)self.streamHealthNoPayloadStreak,
+                (unsigned long)kPayloadStallReconnectThreshold);
+            [self attemptReconnectWithReason:@"payload-stall-reconnect"];
+        } else {
+            Log(LOG_W, @"[diag] Persistent payload stall (%lus >= %lu) detected, manual expert mode holds parameters",
+                (unsigned long)self.streamHealthNoPayloadStreak,
+                (unsigned long)kPayloadStallReconnectThreshold);
+            [self presentManualRiskOverlayForReason:@"payload-stall"];
+        }
+    }
+
+    if (self.streamHealthNoDecodeStreak == 2 || (self.streamHealthNoDecodeStreak > 2 && self.streamHealthNoDecodeStreak % 4 == 0)) {
+        Log(LOG_W, @"[diag] Decode stall suspected for %lus (payload present but decodedFrames==0). rf=%u df=%u ren=%u bytes=%llu jitter=%.2fms rtt=%@",
+            (unsigned long)self.streamHealthNoDecodeStreak,
+            stats.receivedFrames,
+            stats.decodedFrames,
+            stats.renderedFrames,
+            (unsigned long long)stats.receivedBytes,
+            stats.jitterMs,
+            rttLogText);
+    }
+
+    if (self.streamHealthNoRenderStreak == 2 || (self.streamHealthNoRenderStreak > 2 && self.streamHealthNoRenderStreak % 4 == 0)) {
+        Log(LOG_W, @"[diag] Render stall suspected for %lus (decodedFrames>0 but renderedFrames==0). rf=%u df=%u ren=%u bytes=%llu jitter=%.2fms rtt=%@",
+            (unsigned long)self.streamHealthNoRenderStreak,
+            stats.receivedFrames,
+            stats.decodedFrames,
+            stats.renderedFrames,
+            (unsigned long long)stats.receivedBytes,
+            stats.jitterMs,
+            rttLogText);
+    }
+
+    if (self.streamHealthHighDropStreak == 2 || (self.streamHealthHighDropStreak > 2 && self.streamHealthHighDropStreak % 4 == 0)) {
+        Log(LOG_W, @"[diag] Heavy network drop for %lus windows (drop=%.1f%%). total=%u dropped=%u rf=%u df=%u ren=%u bytes=%llu rtt=%@",
+            (unsigned long)self.streamHealthHighDropStreak,
+            dropRate,
+            stats.totalFrames,
+            stats.networkDroppedFrames,
+            stats.receivedFrames,
+            stats.decodedFrames,
+            stats.renderedFrames,
+            (unsigned long long)stats.receivedBytes,
+            rttLogText);
+    }
+
+    // Proactively step down stream settings on persistent severe tunnel loss.
+    // This targets freeze/recover oscillation where status toggles 1->0->1 repeatedly.
+    if (self.streamHealthHighDropStreak >= 4 && dropRate >= 55.0f) {
+        [self attemptAdaptiveMitigationForDropRate:dropRate];
+    }
+
+    // Auto-bitrate ladder (AIMD-like):
+    // - sustained instability: handled by attemptAdaptiveMitigationForDropRate() above (decrease step)
+    // - sustained stability: increase one step toward baseline bitrate cap
+    NSDictionary *prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
+    BOOL autoAdjustBitrate = prefs ? [prefs[@"autoAdjustBitrate"] boolValue] : NO;
+    BOOL routeIsTunnel = NO;
+    if (self.app.host.activeAddress.length > 0) {
+        routeIsTunnel = [Utils isTunnelInterfaceName:[Utils outboundInterfaceNameForAddress:self.app.host.activeAddress sourceAddress:nil]];
+    }
+
+    if (autoAdjustBitrate && routeIsTunnel && self.runtimeAutoBitrateCapKbps > 0 && self.runtimeAutoBitrateBaselineKbps > self.runtimeAutoBitrateCapKbps) {
+        BOOL stableWindow = (statsFresh || hasProgressSinceLast) &&
+                            stats.totalFrames >= 120 &&
+                            dropRate < 3.0f &&
+                            self.streamHealthNoPayloadStreak == 0 &&
+                            self.streamHealthNoDecodeStreak == 0 &&
+                            self.streamHealthNoRenderStreak == 0 &&
+                            self.lastConnectionStatus != CONN_STATUS_POOR;
+
+        if (stableWindow) {
+            self.runtimeAutoBitrateStableStreak += 1;
+        } else {
+            self.runtimeAutoBitrateStableStreak = 0;
+        }
+
+        if (self.runtimeAutoBitrateStableStreak >= 12 &&
+            (self.runtimeAutoBitrateLastRaiseMs == 0 || nowMs - self.runtimeAutoBitrateLastRaiseMs >= 30000)) {
+            int currentCap = (int)self.runtimeAutoBitrateCapKbps;
+            int baseline = (int)self.runtimeAutoBitrateBaselineKbps;
+            int step = MAX(1000, (int)lround((double)currentCap * 0.12));
+            int newCap = MIN(baseline, currentCap + step);
+            if (newCap > currentCap) {
+                self.runtimeAutoBitrateCapKbps = newCap;
+                self.runtimeAutoBitrateLastRaiseMs = nowMs;
+                self.runtimeAutoBitrateStableStreak = 0;
+                Log(LOG_I, @"[diag] Adaptive bitrate raise applied: %d -> %d kbps (stable windows reached, effective on next reconnect/restart)",
+                    currentCap,
+                    newCap);
+            }
+        }
+    } else {
+        self.runtimeAutoBitrateStableStreak = 0;
+    }
+
+    if (self.streamHealthFrozenStatsStreak == 3 || (self.streamHealthFrozenStatsStreak > 3 && self.streamHealthFrozenStatsStreak % 5 == 0)) {
+        Log(LOG_W, @"[diag] Stream stats window stale for %lus (no new video window). rf=%u df=%u ren=%u total=%u bytes=%llu jitter=%.2fms rtt=%@ ageMs=%llu captured=%d input=%d",
+            (unsigned long)self.streamHealthFrozenStatsStreak,
+            stats.receivedFrames,
+            stats.decodedFrames,
+            stats.renderedFrames,
+            stats.totalFrames,
+            (unsigned long long)stats.receivedBytes,
+            stats.jitterMs,
+            rttLogText,
+            (unsigned long long)(statsTimestampValid ? statsAgeMs : 0),
+            self.isMouseCaptured ? 1 : 0,
+            self.hidSupport.shouldSendInputEvents ? 1 : 0);
+    }
+
+    self.streamHealthLastReceivedFrames = stats.receivedFrames;
+    self.streamHealthLastDecodedFrames = stats.decodedFrames;
+    self.streamHealthLastRenderedFrames = stats.renderedFrames;
+    self.streamHealthLastTotalFrames = stats.totalFrames;
+    self.streamHealthLastReceivedBytes = stats.receivedBytes;
+}
+
+- (void)logStreamHealthSummaryWithReason:(NSString *)reason {
+    if (!self.streamMan || !self.streamMan.connection || !self.streamMan.connection.renderer) {
+        Log(LOG_I, @"[diag] Stream health summary (%@): connection unavailable", reason ?: @"unknown");
+        return;
+    }
+
+    VideoStats stats = self.streamMan.connection.renderer.videoStats;
+    uint64_t nowStatsMs = LiGetMillis();
+    BOOL statsTimestampValid = (stats.lastUpdatedTimestamp > 0 && nowStatsMs >= stats.lastUpdatedTimestamp);
+    uint64_t statsAgeMs = statsTimestampValid ? (nowStatsMs - stats.lastUpdatedTimestamp) : 0;
+    BOOL statsFresh = statsTimestampValid && statsAgeMs <= 1500;
+    NSString *rttLogText = [self currentLatencyLogSummary];
+
+    Log(LOG_I, @"[diag] Stream health summary (%@): payloadSeen=%d noPayloadStreak=%lu noDecodeStreak=%lu noRenderStreak=%lu highDropStreak=%lu rf=%u df=%u ren=%u total=%u dropped=%u bytes=%llu jitter=%.2fms rtt=%@ ageMs=%llu fresh=%d captured=%d input=%d",
+        reason ?: @"unknown",
+        self.streamHealthSawPayload ? 1 : 0,
+        (unsigned long)self.streamHealthNoPayloadStreak,
+        (unsigned long)self.streamHealthNoDecodeStreak,
+        (unsigned long)self.streamHealthNoRenderStreak,
+        (unsigned long)self.streamHealthHighDropStreak,
+        stats.receivedFrames,
+        stats.decodedFrames,
+        stats.renderedFrames,
+        stats.totalFrames,
+        stats.networkDroppedFrames,
+        (unsigned long long)stats.receivedBytes,
+        stats.jitterMs,
+        rttLogText,
+        (unsigned long long)statsAgeMs,
+        statsFresh ? 1 : 0,
+        self.isMouseCaptured ? 1 : 0,
+        self.hidSupport.shouldSendInputEvents ? 1 : 0);
+}
+
+- (void)requestStreamCloseWithSource:(NSString *)source {
+    if (![NSThread isMainThread]) {
+        NSString *copied = [source copy];
+        dispatch_async(dispatch_get_main_queue(), ^{
+            [self requestStreamCloseWithSource:copied];
+        });
+        return;
+    }
+    self.pendingDisconnectSource = source.length > 0 ? source : @"unknown";
+    [self performCloseStreamWindow:nil];
+}
+
+- (NSString *)resolvedDisconnectSourceFromSender:(id)sender {
+    NSString *source = self.pendingDisconnectSource;
+    self.pendingDisconnectSource = nil;
+
+    if (source.length == 0) {
+        if ([sender isKindOfClass:[NSMenuItem class]]) {
+            source = @"menu-disconnect";
+        } else if ([sender isKindOfClass:[NSButton class]]) {
+            source = @"button-disconnect";
+        } else {
+            NSEvent *event = NSApp.currentEvent;
+            if (event.type == NSEventTypeKeyDown) {
+                NSString *chars = event.charactersIgnoringModifiers.lowercaseString ?: @"";
+                NSEventModifierFlags mods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+                BOOL hasCommand = (mods & NSEventModifierFlagCommand) != 0;
+                if (hasCommand && [chars isEqualToString:@"w"]) {
+                    source = @"keyboard-cmd-w";
+                }
+            }
+            if (source.length == 0) {
+                source = @"unknown";
+            }
+        }
+    }
+
+    uint64_t now = [self nowMs];
+    if (self.lastOptionUncaptureAtMs > 0 && now >= self.lastOptionUncaptureAtMs && (now - self.lastOptionUncaptureAtMs) <= 2500) {
+        source = [source stringByAppendingString:@"+after-option-uncapture"];
+    }
+
+    return source;
+}
+
+- (BOOL)isRemoteStreamTargetAddress:(NSString *)targetAddress {
+    if (targetAddress.length == 0) {
+        return NO;
+    }
+
+    NSString *targetHost = nil;
+    [Utils parseAddress:targetAddress intoHost:&targetHost andPort:nil];
+    NSString *host = targetHost.length > 0 ? targetHost : targetAddress;
+    NSString *hostLower = host.lowercaseString;
+
+    NSString *localAddr = nil;
+    NSString *mainAddr = nil;
+    NSString *ipv6Addr = nil;
+    NSString *externalAddr = nil;
+    if (self.app.host.localAddress.length > 0) {
+        [Utils parseAddress:self.app.host.localAddress intoHost:&localAddr andPort:nil];
+    }
+    if (self.app.host.address.length > 0) {
+        [Utils parseAddress:self.app.host.address intoHost:&mainAddr andPort:nil];
+    }
+    if (self.app.host.ipv6Address.length > 0) {
+        [Utils parseAddress:self.app.host.ipv6Address intoHost:&ipv6Addr andPort:nil];
+    }
+    if (self.app.host.externalAddress.length > 0) {
+        [Utils parseAddress:self.app.host.externalAddress intoHost:&externalAddr andPort:nil];
+    }
+
+    NSMutableSet<NSString *> *knownLocalHosts = [NSMutableSet setWithCapacity:3];
+    for (NSString *candidate in @[ localAddr ?: @"", mainAddr ?: @"", ipv6Addr ?: @"" ]) {
+        if (MLShouldTreatAsKnownLocalHost(candidate)) {
+            [knownLocalHosts addObject:candidate.lowercaseString];
+        }
+    }
+    if ([knownLocalHosts containsObject:hostLower]) {
+        return NO;
+    }
+
+    if (externalAddr.length > 0 && [externalAddr.lowercaseString isEqualToString:hostLower]) {
+        return YES;
+    }
+
+    if ([hostLower isEqualToString:@"localhost"] || [hostLower hasSuffix:@".local"]) {
+        return NO;
+    }
+
+    if (MLIsPrivateOrLocalIPv4String(host) || MLIsPrivateOrLocalIPv6String(host)) {
+        return NO;
+    }
+
+    // Public IPv4/IPv6 or regular DNS hostname => treat as remote streaming.
+    return YES;
+}
+
 - (void)suppressConnectionWarningsForSeconds:(double)seconds reason:(NSString *)reason {
     uint64_t now = [self nowMs];
     uint64_t until = now + (uint64_t)(seconds * 1000.0);
@@ -2928,6 +3914,23 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 #pragma mark - Streaming Operations
 
 - (void)prepareForStreaming {
+    [self stopStreamHealthDiagnostics];
+    [self resetStreamHealthDiagnostics];
+    self.pendingDisconnectSource = nil;
+    self.activeStreamGeneration += 1;
+    NSUInteger streamGeneration = self.activeStreamGeneration;
+
+    // Defensive cleanup: avoid overlapping stream operations when a previous attempt
+    // hasn't fully quiesced yet.
+    StreamManager *previousStreamMan = self.streamMan;
+    self.streamMan = nil;
+    if (self.streamOpQueue) {
+        [self.streamOpQueue cancelAllOperations];
+    }
+    if (previousStreamMan) {
+        [previousStreamMan stopStream];
+    }
+
     StreamConfiguration *streamConfig = [[StreamConfiguration alloc] init];
     
     streamConfig.host = self.app.host.activeAddress;
@@ -2940,6 +3943,52 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
             streamConfig.host = connectionMethod;
         }
     }
+    BOOL vpnActive = [Utils isActiveNetworkVPN];
+    BOOL remoteByAddress = [self isRemoteStreamTargetAddress:streamConfig.host];
+    NSString *egressSource = nil;
+    NSString *egressIf = [Utils outboundInterfaceNameForAddress:streamConfig.host sourceAddress:&egressSource];
+    BOOL routeKnown = egressIf.length > 0;
+    BOOL remoteByRoute = routeKnown && [Utils isTunnelInterfaceName:egressIf];
+    BOOL remoteByVpnFallback = vpnActive && !routeKnown;
+    streamConfig.streamingRemotely = remoteByAddress || remoteByRoute || remoteByVpnFallback;
+
+    NSMutableArray<NSString *> *reasonParts = [NSMutableArray array];
+    if (streamConfig.streamingRemotely) {
+        if (remoteByRoute) {
+            [reasonParts addObject:[NSString stringWithFormat:@"route-via-%@", egressIf]];
+        }
+        if (remoteByAddress) {
+            [reasonParts addObject:@"address-public-or-external"];
+        }
+        if (remoteByVpnFallback) {
+            [reasonParts addObject:@"vpn-fallback-no-route"];
+        }
+    } else {
+        if (routeKnown) {
+            [reasonParts addObject:[NSString stringWithFormat:@"route-via-%@", egressIf]];
+        } else {
+            [reasonParts addObject:@"route-unknown-no-vpn"];
+        }
+        if (!remoteByAddress) {
+            [reasonParts addObject:@"address-private-or-local"];
+        }
+    }
+    NSString *classifyReason = reasonParts.count > 0 ? [reasonParts componentsJoinedByString:@","] : @"n/a";
+
+    Log(LOG_I, @"[diag] Stream target classification: host=%@ remote=%d local=%d vpn=%d byAddress=%d byRoute=%d byVpnFallback=%d egressIf=%@ source=%@ main=%@ ipv6=%@ external=%@ reason=%@",
+        streamConfig.host ?: @"(null)",
+        streamConfig.streamingRemotely ? 1 : 0,
+        streamConfig.streamingRemotely ? 0 : 1,
+        vpnActive ? 1 : 0,
+        remoteByAddress ? 1 : 0,
+        remoteByRoute ? 1 : 0,
+        remoteByVpnFallback ? 1 : 0,
+        egressIf ?: @"(unknown)",
+        egressSource ?: @"",
+        self.app.host.localAddress ?: @"",
+        self.app.host.ipv6Address ?: @"",
+        self.app.host.externalAddress ?: @"",
+        classifyReason);
     
     streamConfig.appID = self.app.id;
     streamConfig.appName = self.app.name;
@@ -2967,36 +4016,43 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     // Default bitrate (may be overridden by auto-adjust below)
     streamConfig.bitRate = [streamSettings.bitrate intValue];
 
-    // Auto-adjust bitrate (mirrors moonlight-qt default algorithm)
-    BOOL autoAdjustBitrate = prefs ? [prefs[@"autoAdjustBitrate"] boolValue] : NO;
-    if (autoAdjustBitrate) {
-        BOOL enableYuv444 = prefs ? [prefs[@"yuv444"] boolValue] : NO;
-        int modeWidth = streamConfig.width;
-        int modeHeight = streamConfig.height;
-        int modeFps = streamConfig.frameRate;
+    BOOL enableYuv444 = prefs ? [prefs[@"yuv444"] boolValue] : NO;
+    int modeWidth = streamConfig.width;
+    int modeHeight = streamConfig.height;
+    int modeFps = streamConfig.frameRate;
 
-        // Incorporate remote overrides (host render mode) for bitrate calculation
-        if (prefs != nil) {
-            if ([prefs[@"remoteResolution"] boolValue]) {
-                int rw = [prefs[@"remoteResolutionWidth"] intValue];
-                int rh = [prefs[@"remoteResolutionHeight"] intValue];
-                if (rw > 0 && rh > 0) {
-                    modeWidth = rw;
-                    modeHeight = rh;
-                }
-            }
-            if ([prefs[@"remoteFps"] boolValue]) {
-                int rfps = [prefs[@"remoteFpsRate"] intValue];
-                if (rfps > 0) {
-                    modeFps = rfps;
-                }
+    // Incorporate remote overrides (host render mode) for bitrate calculation and risk assessment
+    if (prefs != nil) {
+        if ([prefs[@"remoteResolution"] boolValue]) {
+            int rw = [prefs[@"remoteResolutionWidth"] intValue];
+            int rh = [prefs[@"remoteResolutionHeight"] intValue];
+            if (rw > 0 && rh > 0) {
+                modeWidth = rw;
+                modeHeight = rh;
             }
         }
+        if ([prefs[@"remoteFps"] boolValue]) {
+            int rfps = [prefs[@"remoteFpsRate"] intValue];
+            if (rfps > 0) {
+                modeFps = rfps;
+            }
+        }
+    }
 
-        // Keep even dimensions
-        modeWidth &= ~1;
-        modeHeight &= ~1;
+    // Keep even dimensions
+    modeWidth &= ~1;
+    modeHeight &= ~1;
 
+    // Auto-adjust bitrate (mirrors moonlight-qt default algorithm)
+    BOOL autoAdjustBitrate = prefs ? [prefs[@"autoAdjustBitrate"] boolValue] : NO;
+    streamConfig.autoAdjustBitrate = autoAdjustBitrate;
+    if (!autoAdjustBitrate) {
+        self.runtimeAutoBitrateCapKbps = 0;
+        self.runtimeAutoBitrateBaselineKbps = 0;
+        self.runtimeAutoBitrateStableStreak = 0;
+        self.runtimeAutoBitrateLastRaiseMs = 0;
+    }
+    if (autoAdjustBitrate) {
         // Copied from moonlight-qt (StreamingPreferences::getDefaultBitrate)
         float frameRateFactor = (modeFps <= 60 ? (float)modeFps : (sqrtf((float)modeFps / 60.f) * 60.f)) / 30.f;
 
@@ -3036,11 +4092,47 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 
         int defaultKbps = (int)lroundf(resolutionFactor * frameRateFactor) * 1000;
         streamConfig.bitRate = defaultKbps;
+        self.runtimeAutoBitrateBaselineKbps = streamConfig.bitRate;
+        if (self.runtimeAutoBitrateCapKbps > 0 && self.runtimeAutoBitrateCapKbps > streamConfig.bitRate) {
+            self.runtimeAutoBitrateCapKbps = streamConfig.bitRate;
+        }
+        if (self.runtimeAutoBitrateCapKbps > 0 && streamConfig.bitRate > self.runtimeAutoBitrateCapKbps) {
+            Log(LOG_I, @"[diag] Runtime auto bitrate cap applied: %d -> %ld kbps",
+                streamConfig.bitRate,
+                (long)self.runtimeAutoBitrateCapKbps);
+            streamConfig.bitRate = (int)self.runtimeAutoBitrateCapKbps;
+        }
     }
     streamConfig.optimizeGameSettings = streamSettings.optimizeGames;
     streamConfig.playAudioOnPC = streamSettings.playAudioOnPC;
     streamConfig.allowHevc = streamSettings.useHevc;
     streamConfig.enableHdr = streamSettings.useHevc && VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) ? streamSettings.enableHdr : NO;
+
+    NSString *codecName = streamConfig.allowHevc ? @"H.265" : @"H.264";
+    NSString *connectionMethod = prefs[@"connectionMethod"];
+    self.currentStreamRiskAssessment = [StreamRiskAssessor assessWithHost:self.app.host
+                                                            targetAddress:streamConfig.host
+                                                         connectionMethod:connectionMethod
+                                                                    width:modeWidth
+                                                                   height:modeHeight
+                                                                      fps:modeFps
+                                                              bitrateKbps:streamConfig.bitRate
+                                                                codecName:codecName
+                                                             enableYUV444:enableYuv444
+                                                                 autoMode:autoAdjustBitrate];
+    Log(LOG_I, @"[diag] Stream risk assessment: %@ codec=%@ chroma=%@ decode=%d target=%@",
+        self.currentStreamRiskAssessment.summaryLine ?: @"(none)",
+        self.currentStreamRiskAssessment.codecName ?: codecName,
+        self.currentStreamRiskAssessment.chromaName ?: (enableYuv444 ? @"4:4:4" : @"4:2:0"),
+        self.currentStreamRiskAssessment.decodeSupported ? 1 : 0,
+        self.currentStreamRiskAssessment.targetAddress ?: streamConfig.host ?: @"(null)");
+    if (self.currentStreamRiskAssessment.recommendedFallbacks.count > 0) {
+        StreamRiskRecommendation *firstRecommendation = self.currentStreamRiskAssessment.recommendedFallbacks.firstObject;
+        Log(LOG_I, @"[diag] Recommended fallback: %@", firstRecommendation.summaryLine ?: @"(none)");
+    }
+    if ((self.app.host.serverCodecModeSupport & SCM_MASK_AV1) != 0) {
+        Log(LOG_I, @"[diag] Server advertises AV1, but macOS client UI does not expose AV1 selection yet");
+    }
 
     streamConfig.multiController = streamSettings.multiController;
     streamConfig.gamepadMask = self.useSystemControllerDriver ? (int)[ControllerSupport getConnectedGamepadMask:streamConfig] : 1;
@@ -3067,9 +4159,11 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     }
     self.hidSupport = [[HIDSupport alloc] init:self.app.host];
     
-    self.streamMan = [[StreamManager alloc] initWithConfig:streamConfig renderView:self.view connectionCallbacks:self];
+    id<ConnectionCallbacks> scopedCallbacks = [[MLStreamScopedConnectionCallbacks alloc] initWithOwner:self generation:streamGeneration];
+    self.streamMan = [[StreamManager alloc] initWithConfig:streamConfig renderView:self.view connectionCallbacks:scopedCallbacks];
     if (!self.streamOpQueue) {
         self.streamOpQueue = [[NSOperationQueue alloc] init];
+        self.streamOpQueue.maxConcurrentOperationCount = 1;
     }
     [self.streamOpQueue addOperation:self.streamMan];
 
@@ -3101,12 +4195,342 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     }
 }
 
+- (void)resetLogOverlayState {
+    self.logOverlayDisplayLines = [[NSMutableArray alloc] init];
+    self.logOverlayPausedRawLines = [[NSMutableArray alloc] init];
+    self.logOverlayLastFoldKey = nil;
+    self.logOverlayLastFoldBaseLine = nil;
+    self.logOverlayLastFoldCount = 0;
+    self.logOverlayLastRenderedRange = NSMakeRange(0, 0);
+    self.logOverlayHasLastRenderedRange = NO;
+    self.logOverlayPauseUpdates = NO;
+    self.logOverlayAutoScrollEnabled = YES;
+    self.logOverlaySoftMaxLines = 3000;
+    self.logOverlayTrimToLines = 2400;
+}
+
+- (NSString *)errorCodeFromLogLine:(NSString *)line {
+    if (!line.length) {
+        return nil;
+    }
+    NSRange codeEqRange = [line rangeOfString:@"Code="];
+    if (codeEqRange.location != NSNotFound) {
+        NSUInteger start = codeEqRange.location + codeEqRange.length;
+        NSUInteger len = 0;
+        while (start + len < line.length) {
+            unichar c = [line characterAtIndex:start + len];
+            if ((c >= '0' && c <= '9') || c == '-') {
+                len++;
+            } else {
+                break;
+            }
+        }
+        if (len > 0) {
+            return [line substringWithRange:NSMakeRange(start, len)];
+        }
+    }
+    for (NSString *known in @[ @"-1001", @"-1004", @"-1005" ]) {
+        if ([line containsString:known]) {
+            return known;
+        }
+    }
+    return nil;
+}
+
+- (NSDictionary<NSString *, NSString *> *)compactPresentationForLogLine:(NSString *)rawLine {
+    NSString *line = [rawLine stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (line.length == 0) {
+        return @{ @"key": @"empty", @"line": @"" };
+    }
+
+    NSString *errorCode = [self errorCodeFromLogLine:line];
+
+    if ([line localizedCaseInsensitiveContainsString:@"Internal inconsistency in menus"]) {
+        return @{
+            @"key": @"noise.appkit.menu",
+            @"line": @"<WARN> [系统噪音] AppKit 菜单一致性日志（已折叠）"
+        };
+    }
+
+    if ([line localizedCaseInsensitiveContainsString:@"Discovery summary for "]) {
+        NSString *host = @"unknown";
+        NSRange hostPrefix = [line rangeOfString:@"Discovery summary for " options:NSCaseInsensitiveSearch];
+        if (hostPrefix.location != NSNotFound) {
+            NSUInteger start = NSMaxRange(hostPrefix);
+            NSRange hostRange = [line rangeOfString:@":" options:0 range:NSMakeRange(start, line.length - start)];
+            if (hostRange.location != NSNotFound && hostRange.location > start) {
+                host = [[line substringWithRange:NSMakeRange(start, hostRange.location - start)] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            }
+        }
+        NSString *state = @"state unknown";
+        NSRange stateRange = [line rangeOfString:@":\\s*\\d+\\s+online,\\s*\\d+\\s+offline"
+                                         options:NSRegularExpressionSearch];
+        if (stateRange.location != NSNotFound) {
+            state = [[line substringWithRange:stateRange] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+            if ([state hasPrefix:@":"]) {
+                state = [[state substringFromIndex:1] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            }
+        }
+        return @{
+            @"key": [NSString stringWithFormat:@"noise.discovery.summary.%@.%@", host, state],
+            @"line": [NSString stringWithFormat:@"<INFO> [发现] %@（%@，已折叠）", host, state]
+        };
+    }
+
+    if ([line localizedCaseInsensitiveContainsString:@"Resolved address:"]) {
+        NSString *host = @"unknown";
+        NSRange hostPrefix = [line rangeOfString:@"Resolved address:" options:NSCaseInsensitiveSearch];
+        if (hostPrefix.location != NSNotFound) {
+            NSUInteger start = NSMaxRange(hostPrefix);
+            NSRange arrowRange = [line rangeOfString:@"->" options:0 range:NSMakeRange(start, line.length - start)];
+            if (arrowRange.location != NSNotFound && arrowRange.location > start) {
+                host = [[line substringWithRange:NSMakeRange(start, arrowRange.location - start)] stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            }
+        }
+        return @{
+            @"key": [NSString stringWithFormat:@"noise.discovery.resolved.%@", host],
+            @"line": [NSString stringWithFormat:@"<INFO> [发现] 地址解析 %@（已折叠）", host]
+        };
+    }
+
+    if ([line localizedCaseInsensitiveContainsString:@"[curated]"]
+        && [line localizedCaseInsensitiveContainsString:@"内重复"]) {
+        return @{
+            @"key": @"noise.curated.repeat",
+            @"line": @"<WARN> [日志] 重复抑制摘要（已折叠）"
+        };
+    }
+
+    if ([line localizedCaseInsensitiveContainsString:@"Request failed with error"]) {
+        NSString *code = errorCode ?: @"unknown";
+        return @{
+            @"key": [NSString stringWithFormat:@"noise.net.%@", code],
+            @"line": [NSString stringWithFormat:@"<WARN> [网络] 请求失败 %@（自动回退，已折叠）", code]
+        };
+    }
+
+    if ([line localizedCaseInsensitiveContainsString:@"NSURLErrorDomain"]) {
+        NSString *code = errorCode ?: @"unknown";
+        return @{
+            @"key": [NSString stringWithFormat:@"noise.net.%@", code],
+            @"line": [NSString stringWithFormat:@"<WARN> [网络] NSURLError %@（已折叠）", code]
+        };
+    }
+
+    if (([line localizedCaseInsensitiveContainsString:@"Task <"]
+        && [line localizedCaseInsensitiveContainsString:@"finished with error"])
+        || ([line localizedCaseInsensitiveContainsString:@"Connection "]
+            && [line localizedCaseInsensitiveContainsString:@"failed to connect"])
+        || [line localizedCaseInsensitiveContainsString:@"nw_"]
+        || [line localizedCaseInsensitiveContainsString:@"tcp_input"])
+    {
+        NSString *code = errorCode ?: @"unknown";
+        return @{
+            @"key": [NSString stringWithFormat:@"noise.net.%@", code],
+            @"line": [NSString stringWithFormat:@"<WARN> [网络栈] 连接层噪音 %@（已折叠）", code]
+        };
+    }
+
+    if ([line localizedCaseInsensitiveContainsString:@"Recovered 1 audio data shards from block"]) {
+        return @{
+            @"key": @"stream.audio.fec.recovered",
+            @"line": @"<INFO> [音频] FEC 分片恢复（已折叠）"
+        };
+    }
+
+    if ([line localizedCaseInsensitiveContainsString:@"Recovered 1 video data shards from frame"]) {
+        return @{
+            @"key": @"stream.video.fec.recovered",
+            @"line": @"<INFO> [视频] FEC 分片恢复（已折叠）"
+        };
+    }
+
+    return @{
+        @"key": line,
+        @"line": line
+    };
+}
+
+- (NSString *)foldedDisplayLineWithBase:(NSString *)base count:(NSUInteger)count {
+    if (count <= 1) {
+        return base ?: @"";
+    }
+    return [NSString stringWithFormat:@"%@  ×%lu", base ?: @"", (unsigned long)count];
+}
+
+- (void)appendRenderedLineToOverlayTextView:(NSString *)line {
+    if (!self.logOverlayTextView || !line) {
+        return;
+    }
+
+    NSTextStorage *storage = self.logOverlayTextView.textStorage;
+    if (!storage) {
+        return;
+    }
+
+    BOOL needsNewline = storage.length > 0;
+    if (needsNewline) {
+        [storage appendAttributedString:[[NSAttributedString alloc] initWithString:@"\n"]];
+    }
+
+    NSUInteger start = storage.length;
+    [storage appendAttributedString:[[NSAttributedString alloc] initWithString:line]];
+    self.logOverlayLastRenderedRange = NSMakeRange(start, line.length);
+    self.logOverlayHasLastRenderedRange = YES;
+}
+
+- (void)replaceLastRenderedLineInOverlayTextView:(NSString *)line {
+    if (!self.logOverlayTextView || !line || !self.logOverlayHasLastRenderedRange) {
+        return;
+    }
+    NSTextStorage *storage = self.logOverlayTextView.textStorage;
+    if (!storage) {
+        return;
+    }
+    if (NSMaxRange(self.logOverlayLastRenderedRange) > storage.length) {
+        return;
+    }
+    [storage replaceCharactersInRange:self.logOverlayLastRenderedRange withString:line];
+    self.logOverlayLastRenderedRange = NSMakeRange(self.logOverlayLastRenderedRange.location, line.length);
+}
+
+- (void)rebuildOverlayTextFromDisplayLines {
+    if (!self.logOverlayTextView) {
+        return;
+    }
+    NSString *joined = self.logOverlayDisplayLines.count > 0 ? [self.logOverlayDisplayLines componentsJoinedByString:@"\n"] : @"";
+    self.logOverlayTextView.string = joined;
+    if (self.logOverlayDisplayLines.count > 0) {
+        NSString *last = self.logOverlayDisplayLines.lastObject ?: @"";
+        self.logOverlayLastRenderedRange = NSMakeRange(joined.length - last.length, last.length);
+        self.logOverlayHasLastRenderedRange = YES;
+    } else {
+        self.logOverlayHasLastRenderedRange = NO;
+        self.logOverlayLastRenderedRange = NSMakeRange(0, 0);
+    }
+}
+
+- (void)trimLogOverlayIfNeeded {
+    if (self.logOverlayDisplayLines.count <= self.logOverlaySoftMaxLines) {
+        return;
+    }
+    NSUInteger trimTo = self.logOverlayTrimToLines > 0 ? self.logOverlayTrimToLines : self.logOverlaySoftMaxLines;
+    if (trimTo >= self.logOverlayDisplayLines.count) {
+        return;
+    }
+    NSUInteger removeCount = self.logOverlayDisplayLines.count - trimTo;
+    [self.logOverlayDisplayLines removeObjectsInRange:NSMakeRange(0, removeCount)];
+    [self rebuildOverlayTextFromDisplayLines];
+}
+
+- (void)appendRawLogLineToOverlayState:(NSString *)rawLine {
+    NSDictionary<NSString *, NSString *> *presentation = [self compactPresentationForLogLine:rawLine];
+    NSString *foldKey = presentation[@"key"] ?: rawLine;
+    NSString *baseLine = presentation[@"line"] ?: rawLine;
+    if (!foldKey.length) {
+        foldKey = rawLine ?: @"";
+    }
+    if (!baseLine.length) {
+        baseLine = rawLine ?: @"";
+    }
+
+    if (self.logOverlayLastFoldKey && [self.logOverlayLastFoldKey isEqualToString:foldKey] && self.logOverlayDisplayLines.count > 0) {
+        self.logOverlayLastFoldCount += 1;
+        NSString *merged = [self foldedDisplayLineWithBase:self.logOverlayLastFoldBaseLine count:self.logOverlayLastFoldCount];
+        self.logOverlayDisplayLines[self.logOverlayDisplayLines.count - 1] = merged;
+        [self replaceLastRenderedLineInOverlayTextView:merged];
+        return;
+    }
+
+    self.logOverlayLastFoldKey = foldKey;
+    self.logOverlayLastFoldBaseLine = baseLine;
+    self.logOverlayLastFoldCount = 1;
+    [self.logOverlayDisplayLines addObject:baseLine];
+    [self appendRenderedLineToOverlayTextView:baseLine];
+    [self trimLogOverlayIfNeeded];
+}
+
+- (void)appendRawLinesToOverlayState:(NSArray<NSString *> *)rawLines {
+    for (NSString *line in rawLines) {
+        [self appendRawLogLineToOverlayState:line];
+    }
+}
+
+- (void)scrollLogOverlayToLatest {
+    if (!self.logOverlayTextView) {
+        return;
+    }
+    [self.logOverlayTextView scrollRangeToVisible:NSMakeRange(self.logOverlayTextView.string.length, 0)];
+}
+
+- (void)updateLogOverlayToolbarState {
+    if (!self.logOverlayContainer) {
+        return;
+    }
+    NSButton *pauseBtn = [self.logOverlayContainer viewWithTag:1001];
+    NSButton *autoScrollBtn = [self.logOverlayContainer viewWithTag:1002];
+    NSButton *jumpBtn = [self.logOverlayContainer viewWithTag:1003];
+    NSButton *clearBtn = [self.logOverlayContainer viewWithTag:1006];
+    NSTextField *statusLabel = [self.logOverlayContainer viewWithTag:1005];
+
+    if (pauseBtn) {
+        pauseBtn.title = self.logOverlayPauseUpdates ? @"继续更新" : @"暂停更新";
+    }
+    if (autoScrollBtn) {
+        autoScrollBtn.title = self.logOverlayAutoScrollEnabled ? @"暂停滚动" : @"开启滚动";
+    }
+    if (jumpBtn) {
+        jumpBtn.enabled = self.logOverlayDisplayLines.count > 0;
+    }
+    if (clearBtn) {
+        clearBtn.enabled = (self.logOverlayDisplayLines.count > 0 || self.logOverlayPausedRawLines.count > 0);
+    }
+    if (statusLabel) {
+        if (self.logOverlayPauseUpdates && self.logOverlayPausedRawLines.count > 0) {
+            statusLabel.stringValue = [NSString stringWithFormat:@"显示 %lu 行 | 暂停中，待处理 %lu 条",
+                                       (unsigned long)self.logOverlayDisplayLines.count,
+                                       (unsigned long)self.logOverlayPausedRawLines.count];
+        } else {
+            statusLabel.stringValue = [NSString stringWithFormat:@"显示 %lu 行",
+                                       (unsigned long)self.logOverlayDisplayLines.count];
+        }
+    }
+}
+
+- (NSArray<NSString *> *)compactLinesFromRawLines:(NSArray<NSString *> *)rawLines {
+    NSMutableArray<NSString *> *result = [[NSMutableArray alloc] init];
+    NSString *lastKey = nil;
+    NSString *lastBase = nil;
+    NSUInteger lastCount = 0;
+
+    for (NSString *rawLine in rawLines) {
+        NSDictionary<NSString *, NSString *> *presentation = [self compactPresentationForLogLine:rawLine];
+        NSString *foldKey = presentation[@"key"] ?: rawLine;
+        NSString *baseLine = presentation[@"line"] ?: rawLine;
+        if (!foldKey.length) {
+            foldKey = rawLine ?: @"";
+        }
+        if (!baseLine.length) {
+            baseLine = rawLine ?: @"";
+        }
+
+        if (lastKey && [lastKey isEqualToString:foldKey] && result.count > 0) {
+            lastCount += 1;
+            result[result.count - 1] = [self foldedDisplayLineWithBase:lastBase count:lastCount];
+            continue;
+        }
+
+        lastKey = foldKey;
+        lastBase = baseLine;
+        lastCount = 1;
+        [result addObject:baseLine];
+    }
+
+    return result;
+}
+
 - (void)handleTimeoutCopyLogs:(id)sender {
-    NSArray *lines = [[LogBuffer shared] allLines];
-    NSString *fullLog = [lines componentsJoinedByString:@"\n"];
-    NSPasteboard *pb = [NSPasteboard generalPasteboard];
-    [pb clearContents];
-    [pb setString:fullLog forType:NSPasteboardTypeString];
+    [self copyAllLogsToPasteboard];
 
     if ([sender isKindOfClass:[NSButton class]]) {
         NSButton *btn = (NSButton *)sender;
@@ -3125,6 +4549,8 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
         return;
     }
 
+    [self resetLogOverlayState];
+
     self.logOverlayContainer = [[NSVisualEffectView alloc] initWithFrame:NSZeroRect];
     self.logOverlayContainer.material = NSVisualEffectMaterialHUDWindow;
     self.logOverlayContainer.blendingMode = NSVisualEffectBlendingModeWithinWindow;
@@ -3139,6 +4565,47 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     closeBtn.controlSize = NSControlSizeRegular;
     closeBtn.tag = 999;
     [self.logOverlayContainer addSubview:closeBtn];
+
+    NSButton *pauseBtn = [NSButton buttonWithTitle:@"暂停更新" target:self action:@selector(handleLogOverlayPauseToggle:)];
+    pauseBtn.bezelStyle = NSBezelStyleRounded;
+    pauseBtn.controlSize = NSControlSizeSmall;
+    pauseBtn.tag = 1001;
+    [self.logOverlayContainer addSubview:pauseBtn];
+
+    NSButton *autoScrollBtn = [NSButton buttonWithTitle:@"暂停滚动" target:self action:@selector(handleLogOverlayAutoScrollToggle:)];
+    autoScrollBtn.bezelStyle = NSBezelStyleRounded;
+    autoScrollBtn.controlSize = NSControlSizeSmall;
+    autoScrollBtn.tag = 1002;
+    [self.logOverlayContainer addSubview:autoScrollBtn];
+
+    NSButton *jumpLatestBtn = [NSButton buttonWithTitle:@"最新" target:self action:@selector(handleLogOverlayJumpLatest:)];
+    jumpLatestBtn.bezelStyle = NSBezelStyleRounded;
+    jumpLatestBtn.controlSize = NSControlSizeSmall;
+    jumpLatestBtn.tag = 1003;
+    [self.logOverlayContainer addSubview:jumpLatestBtn];
+
+    NSButton *copyBtn = [NSButton buttonWithTitle:@"复制精简日志" target:self action:@selector(handleLogOverlayCopyCompact:)];
+    copyBtn.bezelStyle = NSBezelStyleRounded;
+    copyBtn.controlSize = NSControlSizeSmall;
+    copyBtn.tag = 1004;
+    [self.logOverlayContainer addSubview:copyBtn];
+
+    NSButton *clearBtn = [NSButton buttonWithTitle:@"清空显示" target:self action:@selector(handleLogOverlayClearFromNow:)];
+    clearBtn.bezelStyle = NSBezelStyleRounded;
+    clearBtn.controlSize = NSControlSizeSmall;
+    clearBtn.tag = 1006;
+    [self.logOverlayContainer addSubview:clearBtn];
+
+    NSTextField *statusLabel = [[NSTextField alloc] initWithFrame:NSZeroRect];
+    statusLabel.bezeled = NO;
+    statusLabel.drawsBackground = NO;
+    statusLabel.editable = NO;
+    statusLabel.selectable = NO;
+    statusLabel.font = [NSFont monospacedSystemFontOfSize:11 weight:NSFontWeightRegular];
+    statusLabel.textColor = [NSColor colorWithWhite:0.85 alpha:1.0];
+    statusLabel.tag = 1005;
+    statusLabel.stringValue = @"显示 0 行";
+    [self.logOverlayContainer addSubview:statusLabel];
 
     self.logOverlayScrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
     self.logOverlayScrollView.hasVerticalScroller = YES;
@@ -3167,10 +4634,10 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     // Seed with existing buffered logs
     NSArray<NSString *> *lines = [[LogBuffer shared] allLines];
     if (lines.count > 0) {
-        NSString *joined = [lines componentsJoinedByString:@"\n"];
-        self.logOverlayTextView.string = joined;
-        [self.logOverlayTextView scrollRangeToVisible:NSMakeRange(self.logOverlayTextView.string.length, 0)];
+        [self appendRawLinesToOverlayState:lines];
+        [self scrollLogOverlayToLatest];
     }
+    [self updateLogOverlayToolbarState];
 
     self.logOverlayContainer.alphaValue = 0.0;
     [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
@@ -3191,6 +4658,12 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     self.logOverlayContainer = nil;
     self.logOverlayScrollView = nil;
     self.logOverlayTextView = nil;
+    self.logOverlayDisplayLines = nil;
+    self.logOverlayPausedRawLines = nil;
+    self.logOverlayLastFoldKey = nil;
+    self.logOverlayLastFoldBaseLine = nil;
+    self.logOverlayLastFoldCount = 0;
+    self.logOverlayHasLastRenderedRange = NO;
 
     [NSAnimationContext runAnimationGroup:^(NSAnimationContext *context) {
         context.duration = 0.15;
@@ -3204,31 +4677,75 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     [self hideLogOverlay];
 }
 
+- (void)handleLogOverlayPauseToggle:(id)sender {
+    self.logOverlayPauseUpdates = !self.logOverlayPauseUpdates;
+    if (!self.logOverlayPauseUpdates && self.logOverlayPausedRawLines.count > 0) {
+        NSArray<NSString *> *pending = [self.logOverlayPausedRawLines copy];
+        [self.logOverlayPausedRawLines removeAllObjects];
+        [self appendRawLinesToOverlayState:pending];
+        [self scrollLogOverlayToLatest];
+    }
+    [self updateLogOverlayToolbarState];
+}
+
+- (void)handleLogOverlayAutoScrollToggle:(id)sender {
+    self.logOverlayAutoScrollEnabled = !self.logOverlayAutoScrollEnabled;
+    if (self.logOverlayAutoScrollEnabled) {
+        [self scrollLogOverlayToLatest];
+    }
+    [self updateLogOverlayToolbarState];
+}
+
+- (void)handleLogOverlayJumpLatest:(id)sender {
+    [self scrollLogOverlayToLatest];
+}
+
+- (void)handleLogOverlayCopyCompact:(id)sender {
+    [self copyAllLogsToPasteboard];
+}
+
+- (void)handleLogOverlayClearFromNow:(id)sender {
+    [self.logOverlayDisplayLines removeAllObjects];
+    [self.logOverlayPausedRawLines removeAllObjects];
+    self.logOverlayLastFoldKey = nil;
+    self.logOverlayLastFoldBaseLine = nil;
+    self.logOverlayLastFoldCount = 0;
+    self.logOverlayHasLastRenderedRange = NO;
+    self.logOverlayLastRenderedRange = NSMakeRange(0, 0);
+    self.logOverlayTextView.string = @"";
+    [self updateLogOverlayToolbarState];
+}
+
 - (void)appendLogLineToOverlay:(NSString *)line {
     if (!self.logOverlayTextView || !line) {
         return;
     }
 
-    // Append while preserving scrolling if user is looking at history
-    // But default to auto-scroll if at bottom
-    
-    // Check if we are scrolled to the bottom (with some tolerance)
-    NSRect visible = self.logOverlayScrollView.contentView.documentVisibleRect;
-    NSRect docRect = self.logOverlayTextView.frame;
-    BOOL wasAtBottom = (NSMaxY(visible) >= NSMaxY(docRect) - 20.0);
-
-    NSString *existing = self.logOverlayTextView.string ?: @"";
-    NSString *newText = existing.length == 0 ? line : [existing stringByAppendingFormat:@"\n%@", line];
-    self.logOverlayTextView.string = newText;
-    
-    if (wasAtBottom) {
-        [self.logOverlayTextView scrollRangeToVisible:NSMakeRange(self.logOverlayTextView.string.length, 0)];
+    if (self.logOverlayPauseUpdates) {
+        [self.logOverlayPausedRawLines addObject:line];
+        if (self.logOverlayPausedRawLines.count > 4000) {
+            [self.logOverlayPausedRawLines removeObjectsInRange:NSMakeRange(0, self.logOverlayPausedRawLines.count - 4000)];
+        }
+        [self updateLogOverlayToolbarState];
+        return;
     }
+
+    [self appendRawLinesToOverlayState:@[ line ]];
+    if (self.logOverlayAutoScrollEnabled) {
+        [self scrollLogOverlayToLatest];
+    }
+    [self updateLogOverlayToolbarState];
 }
 
 - (void)copyAllLogsToPasteboard {
-    NSArray<NSString *> *lines = [[LogBuffer shared] allLines];
-    NSString *joined = [lines componentsJoinedByString:@"\n"];
+    NSString *joined = nil;
+    if (self.logOverlayContainer && self.logOverlayDisplayLines != nil) {
+        joined = [self.logOverlayDisplayLines componentsJoinedByString:@"\n"];
+    } else {
+        NSArray<NSString *> *lines = [[LogBuffer shared] allLines];
+        NSArray<NSString *> *compact = [self compactLinesFromRawLines:lines];
+        joined = [compact componentsJoinedByString:@"\n"];
+    }
     if (joined.length == 0) {
         return;
     }
@@ -3302,6 +4819,10 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     if (!self.shouldAttemptReconnect) {
         return;
     }
+    if (self.reconnectInProgress) {
+        Log(LOG_W, @"[diag] Reconnect request ignored: already reconnecting (reason=%@)", reason ?: @"unknown");
+        return;
+    }
 
     // Preserve fullscreen/windowed state across reconnects.
     self.reconnectPreserveFullscreenStateValid = YES;
@@ -3314,13 +4835,19 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     }
 
     @synchronized (self) {
-        if (self.stopStreamInProgress) {
+        if (self.stopStreamInProgress || self.reconnectInProgress) {
+            Log(LOG_W, @"[diag] Reconnect request ignored by guard: reconnectInProgress=%d stopInProgress=%d reason=%@",
+                self.reconnectInProgress ? 1 : 0,
+                self.stopStreamInProgress ? 1 : 0,
+                reason ?: @"unknown");
             return;
         }
         self.stopStreamInProgress = YES;
+        self.reconnectInProgress = YES;
+        self.activeStreamGeneration += 1;
     }
 
-    self.reconnectInProgress = YES;
+    Log(LOG_I, @"[diag] Reconnect requested: reason=%@", reason ?: @"unknown");
     self.reconnectAttemptCount += 1;
     NSString *msg = [NSString stringWithFormat:MLString(@"Reconnecting… (%ld)", nil), (long)self.reconnectAttemptCount];
     [self showReconnectOverlayWithMessage:msg];
@@ -3384,8 +4911,18 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 
     // Hide until we have at least one received frame (avoid showing a black HUD during RTSP handshake).
     self.overlayContainer.hidden = YES;
-    
-    self.statsTimer = [NSTimer scheduledTimerWithTimeInterval:1.0 target:self selector:@selector(updateStats) userInfo:nil repeats:YES];
+
+    if (self.statsTimer) {
+        [self.statsTimer invalidate];
+        self.statsTimer = nil;
+    }
+    self.statsTimer = [NSTimer timerWithTimeInterval:MLStatsOverlayRefreshIntervalSec
+                                              target:self
+                                            selector:@selector(updateStats)
+                                            userInfo:nil
+                                             repeats:YES];
+    self.statsTimer.tolerance = 0.1;
+    [[NSRunLoop mainRunLoop] addTimer:self.statsTimer forMode:NSRunLoopCommonModes];
     [self updateStats]; // Initial update
 }
 
@@ -3395,7 +4932,12 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     VideoStats stats = self.streamMan.connection.renderer.videoStats;
     int videoFormat = self.streamMan.connection.renderer.videoFormat;
 
-    if (stats.receivedFrames == 0) {
+    BOOL hasVideoData = (stats.receivedFrames > 0 ||
+                         stats.decodedFrames > 0 ||
+                         stats.renderedFrames > 0 ||
+                         stats.receivedBytes > 0);
+    BOOL shouldShowForHealth = (self.streamHealthNoPayloadStreak > 0 || self.streamHealthFrozenStatsStreak > 0);
+    if (!hasVideoData && !shouldShowForHealth) {
         self.overlayContainer.hidden = YES;
         return;
     }
@@ -3421,14 +4963,23 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     int configuredFps = streamSettings.framerate != nil ? [streamSettings.framerate intValue] : 0;
     
     uint32_t rtt = 0;
-    uint32_t rttVar = 0;
+    BOOL rttAvailable = NO;
+    BOOL usingPathProbeLatency = NO;
+    NSInteger pathProbeMs = -1;
     PML_CONTROL_STREAM_CONTEXT controlCtx = self.streamMan.connection ? (PML_CONTROL_STREAM_CONTEXT)[self.streamMan.connection controlStreamContext] : NULL;
-    if (controlCtx) {
-        LiGetEstimatedRttInfoCtx(controlCtx, &rtt, &rttVar);
+    rttAvailable = MLGetUsableRttInfo(controlCtx, &rtt, NULL);
+    if (!rttAvailable) {
+        NSString *preferredAddr = [self currentPreferredAddressForStatus];
+        NSNumber *latency = preferredAddr ? self.app.host.addressLatencies[preferredAddr] : nil;
+        if (latency != nil && latency.integerValue >= 0) {
+            pathProbeMs = MAX(1, latency.integerValue);
+            usingPathProbeLatency = YES;
+        }
     }
     
     float loss = stats.totalFrames > 0 ? (float)stats.networkDroppedFrames / stats.totalFrames * 100.0f : 0;
     float jitter = stats.jitterMs;
+    float onePercentLowFps = stats.renderedFpsOnePercentLow;
 
     // Approximate current video bitrate over the last measurement window (≈1s)
     double bitrateMbps = (double)stats.receivedBytes * 8.0 / 1000.0 / 1000.0;
@@ -3436,6 +4987,20 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     float renderTime = stats.renderedFrames > 0 ? (float)stats.totalRenderTime / stats.renderedFrames : 0;
     float decodeTime = stats.decodedFrames > 0 ? (float)stats.totalDecodeTime / stats.decodedFrames : 0;
     float encodeTime = stats.framesWithHostProcessingLatency > 0 ? (float)stats.totalHostProcessingLatency / 10.0f / stats.framesWithHostProcessingLatency : 0;
+    float pipelineTime = encodeTime + decodeTime + renderTime;
+    BOOL hasTransportEstimate = NO;
+    BOOL streamLatencyApproximate = NO;
+    float transportOneWayMs = 0.0f;
+    if (rttAvailable) {
+        transportOneWayMs = MAX(0.5f, (float)rtt / 2.0f);
+        hasTransportEstimate = YES;
+    } else if (usingPathProbeLatency) {
+        transportOneWayMs = MAX(0.5f, (float)pathProbeMs / 2.0f);
+        hasTransportEstimate = YES;
+        streamLatencyApproximate = YES;
+    }
+    float streamLatencyMs = pipelineTime + transportOneWayMs;
+    BOOL streamLatencyAvailable = (pipelineTime > 0.0f) || hasTransportEstimate;
     
     NSMutableAttributedString *attrString = [[NSMutableAttributedString alloc] init];
     
@@ -3448,7 +5013,6 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
         NSForegroundColorAttributeName: [NSColor colorWithRed:1.0 green:1.0 blue:0.5 alpha:1.0], // Light Yellow
         NSFontAttributeName: [NSFont monospacedDigitSystemFontOfSize:13 weight:NSFontWeightBold]
     };
-    
     void (^append)(NSString *, NSDictionary *) = ^(NSString *str, NSDictionary *attrs) {
         [attrString appendAttributedString:[[NSAttributedString alloc] initWithString:str attributes:attrs]];
     };
@@ -3466,13 +5030,29 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     append(@" De · ", labelAttrs);
     append([NSString stringWithFormat:@"%.1f", stats.renderedFps], valueAttrs);
     append(@" Rd", labelAttrs);
+    append(@"  ", labelAttrs);
+    append(MLString(@"1% Low", nil), labelAttrs);
+    append(@" ", labelAttrs);
+    if (onePercentLowFps > 0.0f) {
+        append([NSString stringWithFormat:@"%.1f", onePercentLowFps], valueAttrs);
+    } else {
+        append(@"--", valueAttrs);
+    }
     
     // Network
-    append(@"  Network ", labelAttrs);
-    append([NSString stringWithFormat:@"%u", rtt], valueAttrs);
-    append(@" ± ", labelAttrs);
-    append([NSString stringWithFormat:@"%u", rttVar], valueAttrs);
-    append(@" ms  Loss ", labelAttrs);
+    append(@"  ", labelAttrs);
+    append(MLString(@"Stream Latency", nil), labelAttrs);
+    append(@" ", labelAttrs);
+    if (streamLatencyAvailable) {
+        if (streamLatencyApproximate) {
+            append(@"~", labelAttrs);
+        }
+        append([NSString stringWithFormat:@"%.1f", streamLatencyMs], valueAttrs);
+        append(@" ms", labelAttrs);
+    } else {
+        append(MLString(@"Not Available", nil), valueAttrs);
+    }
+    append(@"  Loss ", labelAttrs);
     append([NSString stringWithFormat:@"%.2f%%", loss], valueAttrs);
 
     append(@"  Jit ", labelAttrs);
@@ -3482,13 +5062,27 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     append(@" Mbps", labelAttrs);
     
     // Latency
-    append(@"  |  Queue ", labelAttrs);
-    append([NSString stringWithFormat:@"%.2f", renderTime], valueAttrs);
+    append(@"  |  ", labelAttrs);
+    append(MLString(@"Pipeline", nil), labelAttrs);
+    append(@" ", labelAttrs);
+    append([NSString stringWithFormat:@"%.2f", pipelineTime], valueAttrs);
+    append(@" ms · ", labelAttrs);
+    append(MLString(@"Host", nil), labelAttrs);
+    append(@" ", labelAttrs);
+    append([NSString stringWithFormat:@"%.1f", encodeTime], valueAttrs);
     append(@" ms · Decode ", labelAttrs);
     append([NSString stringWithFormat:@"%.2f", decodeTime], valueAttrs);
-    append(@" ms · Encode ", labelAttrs);
-    append([NSString stringWithFormat:@"%.1f", encodeTime], valueAttrs);
+    append(@" ms · Queue ", labelAttrs);
+    append([NSString stringWithFormat:@"%.2f", renderTime], valueAttrs);
     append(@" ms", labelAttrs);
+
+    if (self.streamHealthNoPayloadStreak > 0) {
+        append(@"  |  Stall ", labelAttrs);
+        append([NSString stringWithFormat:@"%lus", (unsigned long)self.streamHealthNoPayloadStreak], valueAttrs);
+    } else if (self.streamHealthFrozenStatsStreak > 0) {
+        append(@"  |  Stale ", labelAttrs);
+        append([NSString stringWithFormat:@"%lus", (unsigned long)self.streamHealthFrozenStatsStreak], valueAttrs);
+    }
 
     self.overlayLabel.attributedStringValue = attrString;
     [self.overlayLabel sizeToFit];
@@ -3614,6 +5208,9 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
                 }
 
         self.streamView.statusText = nil;
+        self.pendingDisconnectSource = nil;
+        [self startStreamHealthDiagnostics];
+        self.streamHealthConnectionStartedMs = [self nowMs];
 
         Log(LOG_I, @"connectionStarted (t=%.0fms) window style=%llu level=%ld", CACurrentMediaTime() * 1000.0, (unsigned long long)self.view.window.styleMask, (long)self.view.window.level);
 
@@ -3666,6 +5263,9 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 
 - (void)connectionTerminated:(int)errorCode {
     Log(LOG_I, @"Connection terminated: %ld", (long)errorCode);
+    [self stopStreamHealthDiagnostics];
+    self.streamHealthConnectionStartedMs = 0;
+    [self logStreamHealthSummaryWithReason:[NSString stringWithFormat:@"connection-terminated:%d", errorCode]];
 
     // Notify session manager
     if (self.app.host.uuid) {
@@ -3727,10 +5327,28 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 
 - (void)stageFailed:(const char *)stageName withError:(int)errorCode {
     Log(LOG_I, @"Stage %s failed: %ld", stageName, errorCode);
+    self.connectWatchdogToken += 1;
+    [self stopStreamHealthDiagnostics];
+    self.streamHealthConnectionStartedMs = 0;
+    if (self.streamMan) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            [weakSelf.streamMan stopStream];
+        });
+    }
     [self closeWindowFromMainQueueWithMessage:[NSString stringWithFormat:@"%s failed with error %d", stageName, errorCode]];
 }
 
 - (void)launchFailed:(NSString *)message {
+    self.connectWatchdogToken += 1;
+    [self stopStreamHealthDiagnostics];
+    self.streamHealthConnectionStartedMs = 0;
+    if (self.streamMan) {
+        __weak typeof(self) weakSelf = self;
+        dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
+            [weakSelf.streamMan stopStream];
+        });
+    }
     [self closeWindowFromMainQueueWithMessage:message];
 }
 
@@ -3748,19 +5366,49 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 
 - (void)connectionStatusUpdate:(int)status {
     dispatch_async(dispatch_get_main_queue(), ^{
+        Log(LOG_I, @"[diag] Connection status update: status=%d captured=%d input=%d reconnect=%d stopInProgress=%d",
+            status,
+            self.isMouseCaptured ? 1 : 0,
+            self.hidSupport.shouldSendInputEvents ? 1 : 0,
+            self.reconnectInProgress ? 1 : 0,
+            self.stopStreamInProgress ? 1 : 0);
+        uint64_t now = [self nowMs];
         if (status == CONN_STATUS_POOR) {
-            uint64_t now = [self nowMs];
+            if (self.lastConnectionStatus != CONN_STATUS_POOR) {
+                if (self.connectionPoorStatusBurstWindowStartMs == 0 ||
+                    now - self.connectionPoorStatusBurstWindowStartMs > 25000) {
+                    self.connectionPoorStatusBurstWindowStartMs = now;
+                    self.connectionPoorStatusBurstCount = 1;
+                } else {
+                    self.connectionPoorStatusBurstCount += 1;
+                }
+            }
+
+            if (self.connectionPoorStatusBurstCount >= 2) {
+                Log(LOG_W, @"[diag] Connection status flap detected (poor bursts=%lu in %.1fs), attempting adaptive mitigation",
+                    (unsigned long)self.connectionPoorStatusBurstCount,
+                    (now - self.connectionPoorStatusBurstWindowStartMs) / 1000.0);
+                self.connectionPoorStatusBurstCount = 0;
+                self.connectionPoorStatusBurstWindowStartMs = now;
+                [self attemptAdaptiveMitigationForDropRate:100.0f];
+            }
+
             if (self.disconnectWasUserInitiated || now < self.suppressConnectionWarningsUntilMs) {
                 // Avoid showing a misleading warning during intentional teardown/detach.
                 [self hideConnectionWarning];
-                return;
-            }
-            if ([SettingsClass showConnectionWarningsFor:self.app.host.uuid]) {
+            } else if ([SettingsClass showConnectionWarningsFor:self.app.host.uuid]) {
                 [self showConnectionWarning];
             }
         } else if (status == CONN_STATUS_OKAY) {
             [self hideConnectionWarning];
+            if (self.lastConnectionStatus == CONN_STATUS_POOR &&
+                (self.connectionLastIdrRequestMs == 0 || now - self.connectionLastIdrRequestMs > 3000)) {
+                LiRequestIdrFrame();
+                self.connectionLastIdrRequestMs = now;
+                Log(LOG_I, @"[diag] Requested IDR on POOR->OKAY transition");
+            }
         }
+        self.lastConnectionStatus = status;
     });
 }
 
@@ -3812,30 +5460,69 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 
     if (self.logOverlayContainer) {
         CGFloat padding = 16.0;
-        CGFloat width = MIN(720.0, self.view.bounds.size.width - padding * 2);
-        CGFloat height = MIN(420.0, self.view.bounds.size.height - padding * 2);
+        CGFloat width = MIN(860.0, self.view.bounds.size.width - padding * 2);
+        CGFloat height = MIN(520.0, self.view.bounds.size.height - padding * 2);
         self.logOverlayContainer.frame = NSMakeRect((self.view.bounds.size.width - width) / 2.0,
                                                    (self.view.bounds.size.height - height) / 2.0,
                                                    width,
                                                    height);
-        
-        // Position Close Button (Tag 999)
+
         NSButton *closeBtn = [self.logOverlayContainer viewWithTag:999];
-        CGFloat topMargin = 0;
-        if (closeBtn) {
-            [closeBtn sizeToFit];
-            CGFloat btnW = closeBtn.frame.size.width + 20; // Some extra padding for hit area
-            if (btnW < 60) btnW = 60;
-            CGFloat btnH = closeBtn.frame.size.height;
-            closeBtn.frame = NSMakeRect(width - btnW - 12, height - btnH - 12, btnW, btnH);
-            topMargin = btnH + 20;
-        } else {
-             topMargin = 12;
+        NSButton *pauseBtn = [self.logOverlayContainer viewWithTag:1001];
+        NSButton *autoScrollBtn = [self.logOverlayContainer viewWithTag:1002];
+        NSButton *jumpBtn = [self.logOverlayContainer viewWithTag:1003];
+        NSButton *copyBtn = [self.logOverlayContainer viewWithTag:1004];
+        NSButton *clearBtn = [self.logOverlayContainer viewWithTag:1006];
+        NSTextField *statusLabel = [self.logOverlayContainer viewWithTag:1005];
+
+        CGFloat topY = height - 38.0;
+        CGFloat x = 12.0;
+        if (pauseBtn && pauseBtn.superview == self.logOverlayContainer) {
+            [pauseBtn sizeToFit];
+            CGFloat btnW = MAX(74.0, pauseBtn.frame.size.width + 16.0);
+            pauseBtn.frame = NSMakeRect(x, topY, btnW, 24.0);
+            x += btnW + 8.0;
+        }
+        if (autoScrollBtn && autoScrollBtn.superview == self.logOverlayContainer) {
+            [autoScrollBtn sizeToFit];
+            CGFloat btnW = MAX(74.0, autoScrollBtn.frame.size.width + 16.0);
+            autoScrollBtn.frame = NSMakeRect(x, topY, btnW, 24.0);
+            x += btnW + 8.0;
+        }
+        if (jumpBtn && jumpBtn.superview == self.logOverlayContainer) {
+            [jumpBtn sizeToFit];
+            CGFloat btnW = MAX(74.0, jumpBtn.frame.size.width + 16.0);
+            jumpBtn.frame = NSMakeRect(x, topY, btnW, 24.0);
+            x += btnW + 8.0;
+        }
+        if (copyBtn && copyBtn.superview == self.logOverlayContainer) {
+            [copyBtn sizeToFit];
+            CGFloat btnW = MAX(74.0, copyBtn.frame.size.width + 16.0);
+            copyBtn.frame = NSMakeRect(x, topY, btnW, 24.0);
+            x += btnW + 8.0;
+        }
+        if (clearBtn && clearBtn.superview == self.logOverlayContainer) {
+            [clearBtn sizeToFit];
+            CGFloat btnW = MAX(74.0, clearBtn.frame.size.width + 16.0);
+            clearBtn.frame = NSMakeRect(x, topY, btnW, 24.0);
+            x += btnW + 8.0;
         }
 
-        self.logOverlayScrollView.frame = NSMakeRect(12, 12, width - 24, height - 12 - topMargin);
-        // Do not force height, only width. Let layout manager handle it.
-        // Or if using manual frame, ensure it's at least the content width.
+        CGFloat closeW = 64.0;
+        if (closeBtn && closeBtn.superview == self.logOverlayContainer) {
+            [closeBtn sizeToFit];
+            closeW = MAX(60.0, closeBtn.frame.size.width + 16.0);
+            closeBtn.frame = NSMakeRect(width - closeW - 12.0, topY, closeW, 24.0);
+        }
+
+        if (statusLabel && statusLabel.superview == self.logOverlayContainer) {
+            CGFloat statusX = x;
+            CGFloat statusW = MAX(120.0, width - statusX - closeW - 24.0);
+            statusLabel.frame = NSMakeRect(statusX, topY + 4.0, statusW, 16.0);
+        }
+
+        CGFloat topMargin = 46.0;
+        self.logOverlayScrollView.frame = NSMakeRect(12.0, 12.0, width - 24.0, height - 12.0 - topMargin);
         [self.logOverlayTextView setFrameSize:NSMakeSize(self.logOverlayScrollView.contentSize.width, self.logOverlayTextView.frame.size.height)];
     }
 
@@ -3900,18 +5587,31 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
         
         // Settings Row - 增加间距
         CGFloat settingsY = 130;
-        CGFloat settingBtnWidth = 102; 
+        CGFloat settingBtnWidth = 96;
         CGFloat settingBtnHeight = 30;
         CGFloat gap = 10;
-        
-        // Row 1: Resolution, Bitrate, Display, Connection
-        NSButton *buttons[] = {self.timeoutResolutionButton, self.timeoutBitrateButton, self.timeoutDisplayModeButton, self.timeoutConnectionButton};
-        size_t count = sizeof(buttons) / sizeof(buttons[0]);
-        CGFloat totalSettingsW = settingBtnWidth * count + gap * (count - 1);
+
+        NSArray<NSButton *> *settingsButtons = @[
+            self.timeoutResolutionButton,
+            self.timeoutBitrateButton,
+            self.timeoutDisplayModeButton,
+            self.timeoutConnectionButton,
+            self.timeoutRecommendedProfileButton,
+        ];
+        NSMutableArray<NSButton *> *visibleSettingsButtons = [NSMutableArray array];
+        for (NSButton *button in settingsButtons) {
+            if (button != nil && !button.hidden) {
+                [visibleSettingsButtons addObject:button];
+            }
+        }
+
+        NSUInteger count = visibleSettingsButtons.count;
+        CGFloat totalSettingsW = count > 0 ? settingBtnWidth * count + gap * (count - 1) : 0;
         CGFloat startX = (width - totalSettingsW) / 2.0;
 
-        for (size_t i = 0; i < count; i++) {
-            buttons[i].frame = NSMakeRect(startX + (settingBtnWidth + gap) * i, settingsY, settingBtnWidth, settingBtnHeight);
+        for (NSUInteger i = 0; i < count; i++) {
+            NSButton *button = visibleSettingsButtons[i];
+            button.frame = NSMakeRect(startX + (settingBtnWidth + gap) * i, settingsY, settingBtnWidth, settingBtnHeight);
         }
         
         // Logs Row - 改进样式，调整位置和尺寸
@@ -4058,7 +5758,7 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 }
 
 - (void)handleGamepadQuitNotification:(NSNotification *)note {
-    [self performCloseStreamWindow:nil];
+    [self requestStreamCloseWithSource:@"gamepad-quit-combo"];
 }
 
 - (void)showNotification:(NSString *)message {

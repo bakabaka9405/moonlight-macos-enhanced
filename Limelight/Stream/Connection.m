@@ -658,18 +658,84 @@ void ClConnectionStatusUpdate(int status)
     _streamConfig.hevcBitratePercentageMultiplier = 75;
 #endif
     
-    // Some moonlight-common-c builds assert if streamingRemotely remains AUTO by SDP generation time.
-    // We resolve it here to LOCAL/REMOTE using our own remote detection.
-    if ([Utils isActiveNetworkVPN] || config.streamingRemotely) {
-        // Force remote streaming mode when a VPN is connected or when the caller has determined
-        // this is a remote session.
-        _streamConfig.streamingRemotely = STREAM_CFG_REMOTE;
-        _streamConfig.packetSize = 1024;
+    // Resolve LOCAL/REMOTE for packet sizing with target-route evidence.
+    // This avoids misclassifying local sessions when a VPN/proxy app is active but not used by this stream.
+    BOOL remoteByConfig = config.streamingRemotely;
+    BOOL vpnActive = [Utils isActiveNetworkVPN];
+    NSString *egressSource = nil;
+    NSString *egressIf = [Utils outboundInterfaceNameForAddress:config.host sourceAddress:&egressSource];
+    BOOL routeKnown = egressIf.length > 0;
+    BOOL routeThroughTunnel = routeKnown && [Utils isTunnelInterfaceName:egressIf];
+    BOOL remoteByVpnFallback = vpnActive && !routeKnown && !remoteByConfig;
+    BOOL useRemotePacketConfig = remoteByConfig || routeThroughTunnel || remoteByVpnFallback;
+
+    if (routeThroughTunnel && !config.autoAdjustBitrate && _streamConfig.fps >= 120 && _streamConfig.bitrate >= 12000) {
+        Log(LOG_W, @"[diag] Tunnel manual profile may be too aggressive: fps=%d bitrate=%d (consider <=90fps or <=10000kbps)",
+            _streamConfig.fps,
+            _streamConfig.bitrate);
     }
-    else {
+
+    if (routeThroughTunnel && config.autoAdjustBitrate) {
+        int tunnelBitrateCap = 8000;
+        if (_streamConfig.fps >= 90) {
+            tunnelBitrateCap = 12000;
+        } else if (_streamConfig.fps >= 60) {
+            tunnelBitrateCap = 10000;
+        }
+        if (_streamConfig.bitrate > tunnelBitrateCap) {
+            Log(LOG_I, @"[diag] Tunnel bitrate cap applied: %d -> %d (fps=%d)",
+                _streamConfig.bitrate,
+                tunnelBitrateCap,
+                _streamConfig.fps);
+            _streamConfig.bitrate = tunnelBitrateCap;
+        }
+    } else if (routeThroughTunnel) {
+        Log(LOG_I, @"[diag] Tunnel bitrate auto-cap skipped: autoAdjustBitrate=0 (fps=%d bitrate=%d)",
+            _streamConfig.fps,
+            _streamConfig.bitrate);
+    }
+
+    Log(LOG_I, @"[diag] Packet config classification: host=%@ remoteByConfig=%d routeKnown=%d routeTunnel=%d vpn=%d vpnFallback=%d egressIf=%@ source=%@ useRemote=%d",
+        config.host ?: @"(null)",
+        remoteByConfig ? 1 : 0,
+        routeKnown ? 1 : 0,
+        routeThroughTunnel ? 1 : 0,
+        vpnActive ? 1 : 0,
+        remoteByVpnFallback ? 1 : 0,
+        egressIf ?: @"(unknown)",
+        egressSource ?: @"",
+        useRemotePacketConfig ? 1 : 0);
+
+    if (useRemotePacketConfig) {
+        _streamConfig.streamingRemotely = STREAM_CFG_REMOTE;
+        // For tunnel paths (utun/wg), prioritize MTU safety over lower PPS.
+        // This avoids burst loss/blackholing that can happen with larger UDP payloads
+        // on encapsulated routes, especially at very high frame rates.
+        if (routeThroughTunnel) {
+            if (_streamConfig.fps >= 120) {
+                _streamConfig.packetSize = 896;
+            } else if (_streamConfig.fps >= 90) {
+                _streamConfig.packetSize = 960;
+            } else {
+                _streamConfig.packetSize = 1024;
+            }
+            Log(LOG_I, @"[diag] Tunnel conservative packet mode: fps=%d bitrate=%d packet=%d",
+                _streamConfig.fps,
+                _streamConfig.bitrate,
+                _streamConfig.packetSize);
+        }
+        else {
+            _streamConfig.packetSize = 1024;
+        }
+    } else {
         _streamConfig.streamingRemotely = STREAM_CFG_LOCAL;
         _streamConfig.packetSize = 1392;
     }
+
+    Log(LOG_I, @"[diag] Packet size chosen: %d (remote=%d tunnel=%d)",
+        _streamConfig.packetSize,
+        _streamConfig.streamingRemotely == STREAM_CFG_REMOTE ? 1 : 0,
+        routeThroughTunnel ? 1 : 0);
     
     // HDR implies HEVC allowed
     if (config.enableHdr) {

@@ -13,6 +13,7 @@ NS_ASSUME_NONNULL_BEGIN
 @interface AppsWorkspaceViewController : NSSplitViewController
 
 @property (nonatomic, strong) TemporaryHost *initialHost;
+@property (nonatomic, readonly, nullable) NSString *currentHostUUID;
 
 - (instancetype)initWithHost:(TemporaryHost *)host;
 - (instancetype)initWithHost:(TemporaryHost *)host hostsSnapshot:(NSArray<TemporaryHost *> *)hostsSnapshot;

@@ -24,6 +24,11 @@ struct ConnectionCandidate: Identifiable {
 class SettingsModel: ObservableObject {
   static let globalHostId = "__global__"
   static let matchDisplayResolutionSentinel = CGSize(width: -1, height: -1)
+  static let debugLogModeKey = "debugLog.mode"
+  static let debugLogMinLevelKey = "debugLog.minLevel"
+  static let debugLogShowSystemNoiseKey = "debugLog.showSystemNoise"
+  static let debugLogAutoScrollKey = "debugLog.autoScroll"
+  static let debugLogTimeScopeKey = "debugLog.timeScope"
 
   private var latencyCache: [String: [String: Any]] = [:]
 
@@ -58,6 +63,33 @@ class SettingsModel: ObservableObject {
   }
 
   @Published var isProfileLocked = false
+  @Published var debugLogMode: String {
+    didSet {
+      UserDefaults.standard.set(debugLogMode, forKey: Self.debugLogModeKey)
+      LoggerSetCuratedModeEnabled(debugLogMode != "raw")
+    }
+  }
+  @Published var debugLogMinLevel: String {
+    didSet {
+      UserDefaults.standard.set(debugLogMinLevel, forKey: Self.debugLogMinLevelKey)
+      LoggerSetMinimumLevel(Self.loggerLevel(from: debugLogMinLevel))
+    }
+  }
+  @Published var debugLogShowSystemNoise: Bool {
+    didSet {
+      UserDefaults.standard.set(debugLogShowSystemNoise, forKey: Self.debugLogShowSystemNoiseKey)
+    }
+  }
+  @Published var debugLogAutoScroll: Bool {
+    didSet {
+      UserDefaults.standard.set(debugLogAutoScroll, forKey: Self.debugLogAutoScrollKey)
+    }
+  }
+  @Published var debugLogTimeScope: String {
+    didSet {
+      UserDefaults.standard.set(debugLogTimeScope, forKey: Self.debugLogTimeScopeKey)
+    }
+  }
 
   func selectHost(id: String?) {
     if let id {
@@ -509,7 +541,7 @@ class SettingsModel: ObservableObject {
         var label = addr
         if effectiveState == 1 {
           if latency >= 0 {
-            label += " (\(latency)ms)"
+            label += " (\(max(1, latency))ms)"
           } else {
             label += " (\(LanguageManager.shared.localize("Online")))"
           }
@@ -780,6 +812,11 @@ class SettingsModel: ObservableObject {
   static let defaultEnableMicrophone = false
   static let defaultStreamResolutionScale = false
   static let defaultStreamResolutionScaleRatio = 100
+  static let defaultDebugLogMode = "curated"
+  static let defaultDebugLogMinLevel = "info"
+  static let defaultDebugLogShowSystemNoise = false
+  static let defaultDebugLogAutoScroll = true
+  static let defaultDebugLogTimeScope = "launch"
 
   private static func mainDisplayPixelSize() -> CGSize? {
     guard let screen = NSScreen.main,
@@ -897,6 +934,45 @@ class SettingsModel: ObservableObject {
     isAdjustingBitrate = false
   }
 
+  private static func normalizedDebugLogMode(_ value: String?) -> String {
+    guard let value else { return defaultDebugLogMode }
+    let normalized = value.lowercased()
+    return normalized == "raw" ? "raw" : "curated"
+  }
+
+  private static func normalizedDebugLogMinLevel(_ value: String?) -> String {
+    guard let value else { return defaultDebugLogMinLevel }
+    switch value.lowercased() {
+    case "all", "debug", "info", "warn", "error":
+      return value.lowercased()
+    default:
+      return defaultDebugLogMinLevel
+    }
+  }
+
+  private static func normalizedDebugLogTimeScope(_ value: String?) -> String {
+    guard let value else { return defaultDebugLogTimeScope }
+    switch value.lowercased() {
+    case "all", "launch", "since_clear":
+      return value.lowercased()
+    default:
+      return defaultDebugLogTimeScope
+    }
+  }
+
+  private static func loggerLevel(from stringValue: String) -> LogLevel {
+    switch stringValue {
+    case "all", "debug":
+      return LOG_D
+    case "warn":
+      return LOG_W
+    case "error":
+      return LOG_E
+    default:
+      return LOG_I
+    }
+  }
+
   init() {
     if let hosts = Self.hosts {
       let selectedProfile = UserDefaults.standard.string(forKey: "selectedSettingsProfile")
@@ -910,6 +986,24 @@ class SettingsModel: ObservableObject {
     } else {
       selectedHost = Host(id: Self.globalHostId, name: "Global")
     }
+
+    let persistedLogMode = UserDefaults.standard.string(forKey: Self.debugLogModeKey)
+    let envLogMode = ProcessInfo.processInfo.environment["MOONLIGHT_LOG_VIEW"]
+    debugLogMode = Self.normalizedDebugLogMode(persistedLogMode ?? envLogMode)
+    debugLogMinLevel = Self.normalizedDebugLogMinLevel(
+      UserDefaults.standard.string(forKey: Self.debugLogMinLevelKey))
+    if UserDefaults.standard.object(forKey: Self.debugLogShowSystemNoiseKey) != nil {
+      debugLogShowSystemNoise = UserDefaults.standard.bool(forKey: Self.debugLogShowSystemNoiseKey)
+    } else {
+      debugLogShowSystemNoise = Self.defaultDebugLogShowSystemNoise
+    }
+    if UserDefaults.standard.object(forKey: Self.debugLogAutoScrollKey) != nil {
+      debugLogAutoScroll = UserDefaults.standard.bool(forKey: Self.debugLogAutoScrollKey)
+    } else {
+      debugLogAutoScroll = Self.defaultDebugLogAutoScroll
+    }
+    debugLogTimeScope = Self.normalizedDebugLogTimeScope(
+      UserDefaults.standard.string(forKey: Self.debugLogTimeScopeKey))
 
     selectedResolution = Self.defaultResolution
     customResWidth = Self.defaultCustomResWidth
@@ -989,6 +1083,9 @@ class SettingsModel: ObservableObject {
     NotificationCenter.default.addObserver(
       self, selector: #selector(handleConnectionMethodUpdate),
       name: NSNotification.Name("ConnectionMethodUpdated"), object: nil)
+
+    LoggerSetCuratedModeEnabled(debugLogMode != "raw")
+    LoggerSetMinimumLevel(Self.loggerLevel(from: debugLogMinLevel))
   }
 
   @objc func handleHostLatencyUpdate(_ notification: Notification) {
@@ -1481,5 +1578,105 @@ class SettingsModel: ObservableObject {
     }
 
     return settingString
+  }
+}
+
+extension SettingsModel {
+  var streamRiskAssessment: StreamRiskAssessment {
+    let mode = effectiveStreamingModeForRiskAssessment()
+    let bitrateKbps = effectiveBitrateKbpsForRiskAssessment(
+      width: mode.width,
+      height: mode.height,
+      fps: mode.fps
+    )
+    return StreamRiskAssessor.assess(
+      host: selectedTemporaryHostForRiskAssessment(),
+      targetAddress: nil,
+      connectionMethod: selectedConnectionMethod,
+      width: mode.width,
+      height: mode.height,
+      fps: mode.fps,
+      bitrateKbps: bitrateKbps,
+      codecName: selectedVideoCodec,
+      enableYUV444: enableYUV444,
+      autoMode: autoAdjustBitrate
+    )
+  }
+
+  private func selectedTemporaryHostForRiskAssessment() -> TemporaryHost? {
+    guard let hostId = selectedHost?.id, hostId != Self.globalHostId else {
+      return nil
+    }
+
+    let dataManager = DataManager()
+    guard let hosts = dataManager.getHosts() as? [TemporaryHost] else {
+      return nil
+    }
+
+    return hosts.first(where: { !$0.uuid.isEmpty && $0.uuid == hostId })
+  }
+
+  private func effectiveStreamingModeForRiskAssessment() -> (width: Int, height: Int, fps: Int) {
+    var resolution = effectiveResolutionForBitrate()
+
+    if streamResolutionScale,
+      streamResolutionScaleRatio > 0,
+      streamResolutionScaleRatio != 100
+    {
+      let scaledWidth = Int(resolution.width) * streamResolutionScaleRatio / 100
+      let scaledHeight = Int(resolution.height) * streamResolutionScaleRatio / 100
+      resolution = CGSize(
+        width: CGFloat((scaledWidth / 8) * 8),
+        height: CGFloat((scaledHeight / 8) * 8)
+      )
+    }
+
+    var width = max(2, Int(resolution.width))
+    var height = max(2, Int(resolution.height))
+    var fps = max(1, effectiveFpsForBitrate())
+
+    if remoteResolutionEnabled {
+      if selectedRemoteResolution == .zero {
+        if let remoteCustomResWidth, let remoteCustomResHeight,
+          remoteCustomResWidth > 0, remoteCustomResHeight > 0
+        {
+          width = Int(remoteCustomResWidth)
+          height = Int(remoteCustomResHeight)
+        }
+      } else {
+        width = Int(selectedRemoteResolution.width)
+        height = Int(selectedRemoteResolution.height)
+      }
+    }
+
+    if remoteFpsEnabled {
+      if selectedRemoteFps == .zero {
+        if let remoteCustomFps, remoteCustomFps > 0 {
+          fps = Int(remoteCustomFps)
+        }
+      } else {
+        fps = selectedRemoteFps
+      }
+    }
+
+    width &= ~1
+    height &= ~1
+
+    return (max(2, width), max(2, height), max(1, fps))
+  }
+
+  private func effectiveBitrateKbpsForRiskAssessment(width: Int, height: Int, fps: Int) -> Int {
+    if autoAdjustBitrate {
+      return Self.getDefaultBitrateKbps(
+        width: width,
+        height: height,
+        fps: fps,
+        yuv444: enableYUV444
+      )
+    }
+
+    let steps = Self.bitrateSteps(unlocked: unlockMaxBitrate)
+    let index = max(0, min(Int(bitrateSliderValue), steps.count - 1))
+    return customBitrate ?? Int(steps[index] * 1000.0)
   }
 }

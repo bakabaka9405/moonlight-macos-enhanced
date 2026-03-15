@@ -6,7 +6,10 @@
 //  Copyright (c) 2014 Moonlight Stream. All rights reserved.
 //
 
-@interface Utils : NSObject
+#import <Foundation/Foundation.h>
+#import <TargetConditionals.h>
+
+NS_ASSUME_NONNULL_BEGIN
 
 typedef NS_ENUM(int, PairState) {
   PairStateUnknown,
@@ -16,23 +19,34 @@ typedef NS_ENUM(int, PairState) {
 
 typedef NS_ENUM(int, State) { StateUnknown, StateOffline, StateOnline };
 
-FOUNDATION_EXPORT NSString *const deviceName;
-
-+ (NSData *)randomBytes:(NSInteger)length;
-+ (NSString *)bytesToHex:(NSData *)data;
-+ (NSData *)hexToBytes:(NSString *)hex;
-+ (void)parseAddress:(NSString *)address
-            intoHost:(NSString **)host
-             andPort:(NSString **)port;
 #if TARGET_OS_IPHONE
-+ (void)addHelpOptionToDialog:(UIAlertController *)dialog;
+@class UIAlertController;
+#endif
+
+FOUNDATION_EXPORT NSString * const _Nonnull deviceName;
+
+@interface Utils : NSObject
+
++ (NSData * _Nonnull)randomBytes:(NSInteger)length;
++ (NSString * _Nonnull)bytesToHex:(NSData * _Nonnull)data;
++ (NSData * _Nonnull)hexToBytes:(NSString * _Nonnull)hex;
++ (void)parseAddress:(NSString * _Nonnull)address
+            intoHost:(NSString * _Nullable * _Nullable)host
+             andPort:(NSString * _Nullable * _Nullable)port;
+#if TARGET_OS_IPHONE
++ (void)addHelpOptionToDialog:(UIAlertController * _Nonnull)dialog;
 #endif
 + (BOOL)isActiveNetworkVPN;
++ (BOOL)isTunnelInterfaceName:(NSString * _Nonnull)ifname;
++ (nullable NSString *)outboundInterfaceNameForAddress:(NSString * _Nonnull)address
+                                         sourceAddress:(NSString * _Nullable * _Nullable)sourceAddress;
 
 @end
 
 @interface NSString (NSStringWithTrim)
 
-- (NSString *)trim;
+- (NSString * _Nonnull)trim;
 
 @end
+
+NS_ASSUME_NONNULL_END

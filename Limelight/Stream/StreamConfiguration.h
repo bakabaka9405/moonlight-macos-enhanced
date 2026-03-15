@@ -19,6 +19,7 @@
 @property(nonatomic) int height;
 @property(nonatomic) int frameRate;
 @property(nonatomic) int bitRate;
+@property(nonatomic) BOOL autoAdjustBitrate;
 @property(nonatomic) int riKeyId;
 @property(nonatomic) BOOL streamingRemotely;
 @property(nonatomic, copy) NSData *riKey;

@@ -17,6 +17,7 @@
 #import "GeneralPrefsPaneVC.h"
 
 #import "AppsViewController.h"
+#import "AppsWorkspaceViewController.h"
 #import "TemporaryHost.h"
 #import "Moonlight-Swift.h"
 
@@ -34,6 +35,35 @@ typedef enum : NSUInteger {
 @end
 
 @implementation AppDelegateForAppKit
+
+- (NSString *)hostUUIDFromViewControllerTree:(NSViewController *)viewController {
+    if (viewController == nil) {
+        return nil;
+    }
+
+    if ([viewController isKindOfClass:[AppsWorkspaceViewController class]]) {
+        NSString *hostUUID = ((AppsWorkspaceViewController *)viewController).currentHostUUID;
+        if (hostUUID.length > 0) {
+            return hostUUID;
+        }
+    }
+
+    if ([viewController isKindOfClass:[AppsViewController class]]) {
+        NSString *hostUUID = ((AppsViewController *)viewController).host.uuid;
+        if (hostUUID.length > 0) {
+            return hostUUID;
+        }
+    }
+
+    for (NSViewController *child in viewController.childViewControllers) {
+        NSString *hostUUID = [self hostUUIDFromViewControllerTree:child];
+        if (hostUUID.length > 0) {
+            return hostUUID;
+        }
+    }
+
+    return nil;
+}
 
 // Opt in explicitly to secure restorable state to avoid the system warning on some macOS versions.
 - (BOOL)applicationSupportsSecureRestorableState:(NSApplication *)app {
@@ -99,20 +129,8 @@ typedef enum : NSUInteger {
 }
 
 - (IBAction)showPreferences:(id)sender {
-    NSString *hostId = nil;
-    
-    // Detect context
     NSViewController *contentVC = NSApplication.sharedApplication.mainWindow.contentViewController;
-    if (contentVC) {
-        // Check if AppsViewController is the active view controller
-        // Based on HostsViewController implementation, AppsVC is added as a child of the main content VC
-        for (NSViewController *child in contentVC.childViewControllers) {
-            if ([child isKindOfClass:[AppsViewController class]]) {
-                hostId = ((AppsViewController *)child).host.uuid;
-                break;
-            }
-        }
-    }
+    NSString *hostId = [self hostUUIDFromViewControllerTree:contentVC];
 
     NSWindowController *prefsWC = [self preferencesWCWithHostId:hostId];
     prefsWC.window.frameAutosaveName = @"Preferences Window";

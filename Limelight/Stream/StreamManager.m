@@ -23,6 +23,7 @@
     OSView* _renderView;
     id<ConnectionCallbacks> _callbacks;
     Connection* _connection;
+    NSOperationQueue* _connectionQueue;
 }
 
 @synthesize connection = _connection;
@@ -48,6 +49,9 @@
     ServerInfoResponse* serverInfoResp = [[ServerInfoResponse alloc] init];
     [hMan executeRequestSynchronously:[HttpRequest requestForResponse:serverInfoResp withUrlRequest:[hMan newServerInfoRequest:false]
                                        fallbackError:401 fallbackRequest:[hMan newHttpServerInfoRequest]]];
+    if (self.isCancelled || _callbacks == nil) {
+        return;
+    }
     NSString* pairStatus = [serverInfoResp getStringTag:@"PairStatus"];
     NSString* appversion = [serverInfoResp getStringTag:@"appversion"];
     NSString* gfeVersion = [serverInfoResp getStringTag:@"GfeVersion"];
@@ -79,6 +83,9 @@
             return;
         }
     }
+    if (self.isCancelled || _callbacks == nil) {
+        return;
+    }
     
 #if TARGET_OS_IPHONE
     // Set mouse delta factors from the screen resolution and stream size
@@ -95,15 +102,29 @@
     
     // Initializing the renderer must be done on the main thread
     dispatch_async(dispatch_get_main_queue(), ^{
+        if (self.isCancelled || self->_callbacks == nil) {
+            return;
+        }
+
         VideoDecoderRenderer* renderer = [[VideoDecoderRenderer alloc] initWithView:self->_renderView];
         self->_connection = [[Connection alloc] initWithConfig:self->_config renderer:renderer connectionCallbacks:self->_callbacks];
-        NSOperationQueue* opQueue = [[NSOperationQueue alloc] init];
-        [opQueue addOperation:self->_connection];
+        if (self.isCancelled || self->_callbacks == nil) {
+            self->_connection = nil;
+            return;
+        }
+
+        [self->_connectionQueue cancelAllOperations];
+        self->_connectionQueue = [[NSOperationQueue alloc] init];
+        self->_connectionQueue.maxConcurrentOperationCount = 1;
+        [self->_connectionQueue addOperation:self->_connection];
     });
 }
 
 - (void) stopStream
 {
+    [self cancel];
+    [_connectionQueue cancelAllOperations];
+    _connectionQueue = nil;
     [_connection terminate];
     _callbacks = nil;
 }

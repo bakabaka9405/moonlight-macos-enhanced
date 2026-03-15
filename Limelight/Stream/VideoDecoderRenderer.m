@@ -11,6 +11,7 @@
 #import "RendererLayerContainer.h"
 
 #include "Limelight.h"
+#include <math.h>
 #include <pthread.h>
 #import "Moonlight-Swift.h"
 
@@ -30,6 +31,56 @@
 @property (nonatomic) int frameRate;
 
 @end
+
+enum {
+    kMLRenderIntervalSampleCapacity = 900,
+};
+
+static int MLCompareUInt16Ascending(const void *lhs, const void *rhs)
+{
+    uint16_t a = *(const uint16_t *)lhs;
+    uint16_t b = *(const uint16_t *)rhs;
+    if (a < b) {
+        return -1;
+    }
+    if (a > b) {
+        return 1;
+    }
+    return 0;
+}
+
+static float MLComputeRenderedOnePercentLowFps(const uint16_t *samples, NSUInteger count)
+{
+    if (samples == NULL || count < 30 || count > kMLRenderIntervalSampleCapacity) {
+        return 0.0f;
+    }
+
+    uint16_t sorted[kMLRenderIntervalSampleCapacity];
+    memcpy(sorted, samples, count * sizeof(uint16_t));
+    qsort(sorted, count, sizeof(uint16_t), MLCompareUInt16Ascending);
+
+    NSUInteger worstSampleCount = MAX((NSUInteger)1, (NSUInteger)ceil((double)count * 0.01));
+    if (worstSampleCount > count) {
+        worstSampleCount = count;
+    }
+
+    NSUInteger startIndex = count - worstSampleCount;
+    uint64_t worstFrameTimeTotalMs = 0;
+    for (NSUInteger idx = startIndex; idx < count; idx++) {
+        worstFrameTimeTotalMs += sorted[idx];
+    }
+
+    if (worstFrameTimeTotalMs == 0) {
+        return 0.0f;
+    }
+
+    double averageWorstFrameTimeMs = (double)worstFrameTimeTotalMs / (double)worstSampleCount;
+    if (averageWorstFrameTimeMs <= 0.0) {
+        return 0.0f;
+    }
+
+    return 1000.0f / (float)averageWorstFrameTimeMs;
+}
 
 static BOOL MLMetalFXIsSupported(void)
 {
@@ -100,6 +151,10 @@ static NSString *const kMetalShaderSource = @"#include <metal_stdlib>\n"
     uint64_t _lastFrameReceiveTimeMs;
     unsigned int _lastFramePresentationTimeMs;
     float _jitterMsEstimate;
+    uint16_t _renderIntervalSamples[kMLRenderIntervalSampleCapacity];
+    NSUInteger _renderIntervalSampleCount;
+    NSUInteger _renderIntervalSampleIndex;
+    uint64_t _lastRenderedSampleTimeMs;
 }
 
 @synthesize videoFormat;
@@ -171,6 +226,10 @@ static CGDirectDisplayID getDisplayID(NSScreen* screen)
     _lastFrameReceiveTimeMs = 0;
     _lastFramePresentationTimeMs = 0;
     _jitterMsEstimate = 0;
+    _renderIntervalSampleCount = 0;
+    _renderIntervalSampleIndex = 0;
+    _lastRenderedSampleTimeMs = 0;
+    memset(_renderIntervalSamples, 0, sizeof(_renderIntervalSamples));
     
     if (_currentFrame) {
         CVBufferRelease(_currentFrame);
@@ -546,8 +605,12 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
             self->_activeWndVideoStats.renderedFps = (float)self->_activeWndVideoStats.renderedFrames;
 
             self->_activeWndVideoStats.jitterMs = self->_jitterMsEstimate;
+            self->_activeWndVideoStats.renderedFpsOnePercentLow = MLComputeRenderedOnePercentLowFps(self->_renderIntervalSamples,
+                                                                                                   self->_renderIntervalSampleCount);
             
-            self->_videoStats = self->_activeWndVideoStats;
+            VideoStats completedStats = self->_activeWndVideoStats;
+            completedStats.lastUpdatedTimestamp = now;
+            self->_videoStats = completedStats;
             
             memset(&self->_activeWndVideoStats, 0, sizeof(VideoStats));
             self->_activeWndVideoStats.measurementStartTimestamp = now;
@@ -581,6 +644,20 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         LiCompleteVideoFrameCtx(depacketizerCtx, handle, ret);
         
         if (ret == DR_OK) {
+            uint64_t renderSampleNowMs = LiGetMillis();
+            if (self->_lastRenderedSampleTimeMs != 0 && renderSampleNowMs > self->_lastRenderedSampleTimeMs) {
+                uint64_t frameIntervalMs = renderSampleNowMs - self->_lastRenderedSampleTimeMs;
+                if (frameIntervalMs > UINT16_MAX) {
+                    frameIntervalMs = UINT16_MAX;
+                }
+                self->_renderIntervalSamples[self->_renderIntervalSampleIndex] = (uint16_t)frameIntervalMs;
+                self->_renderIntervalSampleIndex = (self->_renderIntervalSampleIndex + 1) % kMLRenderIntervalSampleCapacity;
+                if (self->_renderIntervalSampleCount < kMLRenderIntervalSampleCapacity) {
+                    self->_renderIntervalSampleCount++;
+                }
+            }
+            self->_lastRenderedSampleTimeMs = renderSampleNowMs;
+
             self->_activeWndVideoStats.decodedFrames++;
             self->_activeWndVideoStats.renderedFrames++;
             self->_activeWndVideoStats.totalDecodeTime += LiGetMillis() - decodeStart;

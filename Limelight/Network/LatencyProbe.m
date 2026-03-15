@@ -61,7 +61,7 @@
         return nil;
     }
 
-    return @( (int)llround(ms) );
+    return @( MAX(1, (int)llround(ms)) );
 }
 
 @end
