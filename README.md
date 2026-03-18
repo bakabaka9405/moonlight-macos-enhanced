@@ -74,12 +74,17 @@
 
 ### ⌨️ 快捷键
 
+以下为默认串流快捷键，可在 `设置 > Input > Keyboard > Streaming Shortcuts` 中录制和修改。`⌘W`、`⌘H`、`⌃⌘F` 等窗口或系统快捷键保持固定。
+
 | 快捷键 | 功能 |
 |--------|------|
 | `Ctrl` + `Option` | 释放鼠标 |
+| `Ctrl` + `Option` + `C` | 打开控制中心 |
 | `Ctrl` + `Option` + `S` | 切换性能浮窗 |
+| `Ctrl` + `Option` + `M` | 切换鼠标模式 |
+| `Ctrl` + `Option` + `G` | 切换全屏悬浮球 |
 | `Ctrl` + `Option` + `W` | 断开连接 |
-| `Ctrl` + `Shift` + `W` | 退出应用 |
+| `Ctrl` + `Option` + `Command` + `B` | 切换无边框窗口 |
 
 ### 🛠️ 安装
 

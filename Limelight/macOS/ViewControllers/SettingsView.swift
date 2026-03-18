@@ -1087,6 +1087,11 @@ struct InputView: View {
           ToggleCell(
             title: "Capture system keyboard shortcuts",
             boolBinding: $settingsModel.captureSystemShortcuts)
+
+          Divider()
+
+          StreamShortcutSettingsSection(
+            isGlobalProfileSelected: settingsModel.selectedHost?.id == SettingsModel.globalHostId)
         }
 
         Spacer()

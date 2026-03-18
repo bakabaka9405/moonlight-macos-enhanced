@@ -104,6 +104,7 @@
 				"macOS/Helpers/NSView+Moonlight.m",
 				"macOS/Helpers/NSWindow+Moonlight.m",
 				macOS/Helpers/NumberOnlyFormatter.swift,
+				macOS/Helpers/StreamShortcuts.swift,
 				macOS/Helpers/ViewExtensions.swift,
 				macOS/HostCell.xib,
 				"macOS/Supporting Files/main.m",
@@ -116,6 +117,8 @@
 				macOS/ViewControllers/ConnectionDetailsViewController.swift,
 				macOS/ViewControllers/ConnectionEditorViewController.m,
 				macOS/ViewControllers/ContainerViewController.m,
+				macOS/ViewControllers/DebugLogNoiseClassifier.swift,
+				macOS/ViewControllers/DebugLogParser.swift,
 				macOS/ViewControllers/GeneralPrefsPaneVC.m,
 				macOS/ViewControllers/GeneralPrefsPaneView.xib,
 				macOS/ViewControllers/HostCell.m,
@@ -124,8 +127,6 @@
 				macOS/ViewControllers/HostsViewController.m,
 				macOS/ViewControllers/Settings.swift,
 				macOS/ViewControllers/SettingsHostingController.swift,
-				macOS/ViewControllers/DebugLogNoiseClassifier.swift,
-				macOS/ViewControllers/DebugLogParser.swift,
 				macOS/ViewControllers/SettingsModel.swift,
 				macOS/ViewControllers/SettingsView.swift,
 				macOS/ViewControllers/StreamRiskAssessment.swift,
@@ -373,10 +374,12 @@
 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
 				CODE_SIGN_ENTITLEMENTS = Moonlight.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
+				DEVELOPMENT_TEAM = 6W2WXQR6M2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
@@ -404,7 +407,7 @@
 					"-weak_framework",
 					MetalFX,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = std.skyhua.MoonlightMac;
+				PRODUCT_BUNDLE_IDENTIFIER = std.bakabaka.MoonlightMac;
 				PRODUCT_NAME = Moonlight;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "Limelight/Moonlight-Bridging-Header.h";
@@ -431,11 +434,13 @@
 				CLANG_WARN_UNGUARDED_AVAILABILITY = YES_AGGRESSIVE;
 				CODE_SIGN_ENTITLEMENTS = Moonlight.entitlements;
 				CODE_SIGN_IDENTITY = "Apple Development";
+				"CODE_SIGN_IDENTITY[sdk=macosx*]" = "-";
 				CODE_SIGN_STYLE = Automatic;
 				COMBINE_HIDPI_IMAGES = YES;
 				COPY_PHASE_STRIP = NO;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = "dwarf-with-dsym";
+				DEVELOPMENT_TEAM = 6W2WXQR6M2;
 				ENABLE_APP_SANDBOX = YES;
 				ENABLE_HARDENED_RUNTIME = YES;
 				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
@@ -463,7 +468,7 @@
 					"-weak_framework",
 					MetalFX,
 				);
-				PRODUCT_BUNDLE_IDENTIFIER = std.skyhua.MoonlightMac;
+				PRODUCT_BUNDLE_IDENTIFIER = std.bakabaka.MoonlightMac;
 				PRODUCT_NAME = Moonlight;
 				PROVISIONING_PROFILE_SPECIFIER = "";
 				SWIFT_OBJC_BRIDGING_HEADER = "Limelight/Moonlight-Bridging-Header.h";

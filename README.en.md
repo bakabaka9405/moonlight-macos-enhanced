@@ -74,12 +74,17 @@ A native macOS client for game streaming, built with AppKit/SwiftUI. Combines th
 
 ### ⌨️ Keyboard Shortcuts
 
+These are the default streaming shortcuts. You can record and change them in `Settings > Input > Keyboard > Streaming Shortcuts`. Window and system shortcuts such as `⌘W`, `⌘H`, and `⌃⌘F` remain fixed.
+
 | Shortcut | Action |
 |----------|--------|
 | `Ctrl` + `Option` | Release mouse cursor |
+| `Ctrl` + `Option` + `C` | Open Control Center |
 | `Ctrl` + `Option` + `S` | Toggle performance overlay |
+| `Ctrl` + `Option` + `M` | Toggle mouse mode |
+| `Ctrl` + `Option` + `G` | Toggle fullscreen control ball |
 | `Ctrl` + `Option` + `W` | Disconnect stream |
-| `Ctrl` + `Shift` + `W` | Quit application |
+| `Ctrl` + `Option` + `Command` + `B` | Toggle borderless window |
 
 ### 🛠️ Installation
 

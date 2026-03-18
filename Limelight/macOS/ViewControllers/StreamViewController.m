@@ -315,8 +315,8 @@ highFreqMotor:(unsigned short)highFreqMotor {
 @property (nonatomic) BOOL disconnectWasUserInitiated;
 @property (nonatomic) uint64_t suppressConnectionWarningsUntilMs;
 @property (nonatomic, copy) NSString *pendingDisconnectSource;
-@property (nonatomic) uint64_t lastOptionUncaptureAtMs;
-@property (nonatomic) NSUInteger pendingOptionUncaptureToken;
+@property (nonatomic) uint64_t lastReleaseMouseShortcutAtMs;
+@property (nonatomic) NSUInteger pendingModifierOnlyShortcutToken;
 @property (nonatomic) BOOL isMouseCaptured;
 @property (nonatomic) BOOL isRemoteDesktopMode;
 @property (atomic) BOOL stopStreamInProgress;
@@ -389,6 +389,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
 
 @property (nonatomic, strong) id settingsDidChangeObserver;
 @property (nonatomic, strong) id hostLatencyUpdatedObserver;
+@property (nonatomic, strong) id shortcutBindingsDidChangeObserver;
 
 @property (nonatomic) PendingWindowMode pendingWindowMode;
 - (void)applyBorderlessMode;
@@ -499,7 +500,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     self.suppressConnectionWarningsUntilMs = 0;
     self.pendingDisconnectSource = nil;
     self.currentStreamRiskAssessment = nil;
-    self.lastOptionUncaptureAtMs = 0;
+    self.lastReleaseMouseShortcutAtMs = 0;
     self.stopStreamInProgress = NO;
     self.shouldAttemptReconnect = YES;
     self.reconnectAttemptCount = 0;
@@ -623,6 +624,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 
     // Listen for disconnect requests from the session manager
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleSessionDisconnectRequest:) name:@"StreamingSessionRequestDisconnect" object:nil];
+
+    self.shortcutBindingsDidChangeObserver = [[NSNotificationCenter defaultCenter] addObserverForName:[StreamShortcutsStore didChangeNotification] object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
+        [weakSelf rebuildStreamMenu];
+    }];
 
     [self installStreamMenuEntrypoints];
 }
@@ -1388,6 +1393,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
         [[NSNotificationCenter defaultCenter] removeObserver:self.hostLatencyUpdatedObserver];
         self.hostLatencyUpdatedObserver = nil;
     }
+    if (self.shortcutBindingsDidChangeObserver) {
+        [[NSNotificationCenter defaultCenter] removeObserver:self.shortcutBindingsDidChangeObserver];
+        self.shortcutBindingsDidChangeObserver = nil;
+    }
 
     if (self.logDidAppendObserver) {
         [[NSNotificationCenter defaultCenter] removeObserver:self.logDidAppendObserver];
@@ -1426,6 +1435,92 @@ highFreqMotor:(unsigned short)highFreqMotor {
     return ((self.view.window.styleMask & NSWindowStyleMaskTitled) == 0) && !isFullscreen;
 }
 
+- (void)cancelPendingModifierOnlyShortcut {
+    self.pendingModifierOnlyShortcutToken += 1;
+}
+
+- (void)performReleaseMouseShortcut {
+    self.lastReleaseMouseShortcutAtMs = [self nowMs];
+    [self.hidSupport releaseAllModifierKeys];
+    [self suppressConnectionWarningsForSeconds:2.0 reason:@"shortcut-release-mouse"];
+    [self uncaptureMouse];
+}
+
+- (BOOL)handleConfiguredStreamShortcutAction:(StreamShortcutAction)action source:(NSString *)source {
+    switch (action) {
+        case StreamShortcutActionReleaseMouse:
+            [self performReleaseMouseShortcut];
+            return YES;
+
+        case StreamShortcutActionOpenControlCenter:
+            if ([self isWindowBorderlessMode] || [self isWindowFullscreen]) {
+                [self presentStreamMenuFromView:self.view];
+                return YES;
+            }
+            return NO;
+
+        case StreamShortcutActionDisconnectStream:
+            [self.hidSupport releaseAllModifierKeys];
+            [self requestStreamCloseWithSource:source ?: @"keyboard-configured-disconnect"];
+            return YES;
+
+        case StreamShortcutActionToggleConnectionDetails:
+            [self toggleOverlay];
+            return YES;
+
+        case StreamShortcutActionToggleMouseMode:
+            [self toggleMouseMode];
+            return YES;
+
+        case StreamShortcutActionToggleFullscreenControlBall:
+            [self toggleFullscreenControlBallVisibility];
+            return YES;
+
+        case StreamShortcutActionToggleBorderlessWindow:
+            if ([self isWindowBorderlessMode]) {
+                [self switchToWindowedMode:nil];
+            } else {
+                [self switchToBorderlessMode:nil];
+            }
+            return YES;
+    }
+}
+
+- (BOOL)handleConfiguredStreamShortcutForEvent:(NSEvent *)event source:(NSString *)source {
+    NSNumber *shortcutActionValue = [StreamShortcutsStore actionForKeyEvent:event];
+    if (shortcutActionValue == nil) {
+        return NO;
+    }
+
+    [self cancelPendingModifierOnlyShortcut];
+    StreamShortcutAction action = (StreamShortcutAction)shortcutActionValue.integerValue;
+    return [self handleConfiguredStreamShortcutAction:action source:source];
+}
+
+- (void)scheduleModifierOnlyShortcutIfNeededForFlags:(NSEventModifierFlags)modifierFlags {
+    NSNumber *shortcutActionValue = [StreamShortcutsStore modifierOnlyActionForModifierFlagsRawValue:modifierFlags];
+    if (shortcutActionValue == nil) {
+        [self cancelPendingModifierOnlyShortcut];
+        return;
+    }
+
+    StreamShortcutAction action = (StreamShortcutAction)shortcutActionValue.integerValue;
+    NSUInteger token = ++self.pendingModifierOnlyShortcutToken;
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        if (token != self.pendingModifierOnlyShortcutToken) {
+            return;
+        }
+
+        NSEventModifierFlags currentMods = [NSEvent modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
+        NSNumber *currentActionValue = [StreamShortcutsStore modifierOnlyActionForModifierFlagsRawValue:currentMods];
+        if (currentActionValue == nil || currentActionValue.integerValue != action) {
+            return;
+        }
+
+        [self handleConfiguredStreamShortcutAction:action source:@"keyboard-modifier-only-shortcut"];
+    });
+}
+
 - (void)installLocalKeyMonitorIfNeeded {
     if (self.localKeyDownMonitor) {
         return;
@@ -1448,27 +1543,8 @@ highFreqMotor:(unsigned short)highFreqMotor {
             return event;
         }
 
-        const NSEventModifierFlags allowed = (NSEventModifierFlagShift | NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand | NSEventModifierFlagFunction);
-        const NSEventModifierFlags mods = event.modifierFlags & allowed;
-
-        // Escape hatch: Ctrl+Alt+Cmd+B toggles borderless <-> windowed.
-        if (event.keyCode == kVK_ANSI_B && mods == (NSEventModifierFlagControl | NSEventModifierFlagOption | NSEventModifierFlagCommand)) {
-            strongSelf.pendingOptionUncaptureToken += 1;
-            if ([strongSelf isWindowBorderlessMode]) {
-                [strongSelf switchToWindowedMode:nil];
-            } else {
-                [strongSelf switchToBorderlessMode:nil];
-            }
+        if ([strongSelf handleConfiguredStreamShortcutForEvent:event source:@"keyboard-local-monitor"]) {
             return nil;
-        }
-
-        // Ctrl+Option+C opens the control center in borderless/fullscreen mode
-        if (event.keyCode == kVK_ANSI_C && mods == (NSEventModifierFlagControl | NSEventModifierFlagOption)) {
-            if ([strongSelf isWindowBorderlessMode] || [strongSelf isWindowFullscreen]) {
-                strongSelf.pendingOptionUncaptureToken += 1;
-                [strongSelf presentStreamMenuFromView:strongSelf.view];
-                return nil;
-            }
         }
 
         return event;
@@ -1515,43 +1591,8 @@ highFreqMotor:(unsigned short)highFreqMotor {
 
 - (void)flagsChanged:(NSEvent *)event {
     [self.hidSupport flagsChanged:event];
-
-    if ((event.keyCode == kVK_Option || event.keyCode == kVK_RightOption) &&
-        (event.modifierFlags & NSEventModifierFlagOption)) {
-        NSEventModifierFlags relevantMods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
-        BOOL hasControl = (relevantMods & NSEventModifierFlagControl) != 0;
-
-        if (hasControl) {
-            NSUInteger token = ++self.pendingOptionUncaptureToken;
-            dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(0.15 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
-                if (token != self.pendingOptionUncaptureToken) {
-                    return;
-                }
-
-                NSEventModifierFlags currentMods = [NSEvent modifierFlags] & NSEventModifierFlagDeviceIndependentFlagsMask;
-                BOOL optionStillHeld = (currentMods & NSEventModifierFlagOption) != 0;
-                BOOL controlStillHeld = (currentMods & NSEventModifierFlagControl) != 0;
-                if (!optionStillHeld || !controlStillHeld) {
-                    return;
-                }
-
-                self.lastOptionUncaptureAtMs = [self nowMs];
-                [self.hidSupport releaseAllModifierKeys];
-                [self suppressConnectionWarningsForSeconds:2.0 reason:@"option-uncapture"];
-                [self uncaptureMouse];
-            });
-            return;
-        }
-
-        self.pendingOptionUncaptureToken += 1;
-        self.lastOptionUncaptureAtMs = [self nowMs];
-        [self.hidSupport releaseAllModifierKeys];
-        // User is intentionally detaching local input/cursor; suppress transient connection warnings.
-        [self suppressConnectionWarningsForSeconds:2.0 reason:@"option-uncapture"];
-        [self uncaptureMouse];
-    } else if (!(event.modifierFlags & NSEventModifierFlagOption)) {
-        self.pendingOptionUncaptureToken += 1;
-    }
+    NSEventModifierFlags relevantMods = event.modifierFlags & NSEventModifierFlagDeviceIndependentFlagsMask;
+    [self scheduleModifierOnlyShortcutIfNeededForFlags:relevantMods];
 }
 
 - (void)keyDown:(NSEvent *)event {
@@ -1673,29 +1714,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
         return NO;
     }
 
-    if (event.keyCode == kVK_ANSI_W && eventModifierFlags == (NSEventModifierFlagOption | NSEventModifierFlagControl)) {
-        self.pendingOptionUncaptureToken += 1;
-        [self.hidSupport releaseAllModifierKeys];
-        [self requestStreamCloseWithSource:@"keyboard-ctrl-option-w"];
-        return YES;
-    }
-    
-    if (event.keyCode == kVK_ANSI_S && eventModifierFlags == (NSEventModifierFlagControl | NSEventModifierFlagOption)) {
-        self.pendingOptionUncaptureToken += 1;
-        [self toggleOverlay];
-        return YES;
-    }
-
-    if (event.keyCode == kVK_ANSI_M && eventModifierFlags == (NSEventModifierFlagControl | NSEventModifierFlagOption)) {
-        self.pendingOptionUncaptureToken += 1;
-        [self toggleMouseMode];
-        return YES;
-    }
-
-    // Ctrl+Alt+G: toggle fullscreen floating control ball
-    if (event.keyCode == kVK_ANSI_G && eventModifierFlags == (NSEventModifierFlagControl | NSEventModifierFlagOption)) {
-        self.pendingOptionUncaptureToken += 1;
-        [self toggleFullscreenControlBallVisibility];
+    if ([self handleConfiguredStreamShortcutForEvent:event source:@"keyboard-equivalent"]) {
         return YES;
     }
     
@@ -2398,6 +2417,37 @@ highFreqMotor:(unsigned short)highFreqMotor {
     [self applyBorderlessMode];
 }
 
+- (void)applyConfigurableShortcutToMenuItem:(NSMenuItem *)item baseTitle:(NSString *)baseTitle action:(StreamShortcutAction)action {
+    item.title = baseTitle;
+    item.keyEquivalent = @"";
+    item.keyEquivalentModifierMask = 0;
+
+    NSString *menuEquivalent = [StreamShortcutsStore menuKeyEquivalentFor:action];
+    NSString *displayString = [StreamShortcutsStore bindingDisplayStringFor:action];
+    if (menuEquivalent.length > 0) {
+        item.keyEquivalent = menuEquivalent;
+        item.keyEquivalentModifierMask = (NSEventModifierFlags)[StreamShortcutsStore menuModifierFlagsRawValueFor:action];
+        return;
+    }
+
+    if ([StreamShortcutsStore isShortcutConfiguredFor:action] && displayString.length > 0) {
+        item.title = [NSString stringWithFormat:@"%@ (%@)", baseTitle, displayString];
+    }
+}
+
+- (void)applySecondaryShortcutDisplayToMenuItem:(NSMenuItem *)item baseTitle:(NSString *)baseTitle action:(StreamShortcutAction)action {
+    item.title = baseTitle;
+
+    if (![StreamShortcutsStore isShortcutConfiguredFor:action]) {
+        return;
+    }
+
+    NSString *displayString = [StreamShortcutsStore bindingDisplayStringFor:action];
+    if (displayString.length > 0) {
+        item.title = [NSString stringWithFormat:@"%@ (%@)", baseTitle, displayString];
+    }
+}
+
 - (void)rebuildStreamMenu {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -2423,9 +2473,11 @@ highFreqMotor:(unsigned short)highFreqMotor {
 
     NSMenuItem *mouseModeItem = [[NSMenuItem alloc] initWithTitle:isRemoteMode ? @"远控模式" : @"游戏模式"
                                                            action:@selector(toggleMouseModeFromMenu:)
-                                                    keyEquivalent:@"m"];
-    mouseModeItem.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagOption;
+                                                    keyEquivalent:@""];
     mouseModeItem.target = self;
+    [self applyConfigurableShortcutToMenuItem:mouseModeItem
+                                    baseTitle:(isRemoteMode ? @"远控模式" : @"游戏模式")
+                                       action:StreamShortcutActionToggleMouseMode];
     setSymbol(mouseModeItem, isRemoteMode ? @"desktopcomputer" : @"gamecontroller");
     [self.streamMenu addItem:mouseModeItem];
 
@@ -2467,20 +2519,33 @@ highFreqMotor:(unsigned short)highFreqMotor {
     setSymbol(borderlessItem, @"rectangle.dashed");
     [windowMenu addItem:borderlessItem];
 
+    NSMenuItem *toggleBorderlessItem = [[NSMenuItem alloc] initWithTitle:@"切换无边框窗口" action:@selector(toggleBorderlessWindowFromMenu:) keyEquivalent:@""];
+    toggleBorderlessItem.target = self;
+    [self applyConfigurableShortcutToMenuItem:toggleBorderlessItem
+                                    baseTitle:@"切换无边框窗口"
+                                       action:StreamShortcutActionToggleBorderlessWindow];
+    setSymbol(toggleBorderlessItem, @"rectangle.inset.filled.and.person.filled");
+    [windowMenu addItem:toggleBorderlessItem];
+
     [windowMenu addItem:[NSMenuItem separatorItem]];
 
     NSMenuItem *toggleBallItem = [[NSMenuItem alloc] initWithTitle:@"全屏显示悬浮球" action:@selector(toggleFullscreenControlBallFromMenu:) keyEquivalent:@""];
     toggleBallItem.target = self;
     toggleBallItem.state = self.hideFullscreenControlBall ? NSControlStateValueOff : NSControlStateValueOn;
+    [self applyConfigurableShortcutToMenuItem:toggleBallItem
+                                    baseTitle:@"全屏显示悬浮球"
+                                       action:StreamShortcutActionToggleFullscreenControlBall];
     setSymbol(toggleBallItem, @"dot.circle.and.hand.point.up.left.fill");
     [windowMenu addItem:toggleBallItem];
 
     [windowMenu addItem:[NSMenuItem separatorItem]];
 
-    NSMenuItem *detailsItem = [[NSMenuItem alloc] initWithTitle:@"连接详情" action:@selector(toggleOverlay) keyEquivalent:@"s"];
-    detailsItem.keyEquivalentModifierMask = NSEventModifierFlagControl | NSEventModifierFlagOption;
+    NSMenuItem *detailsItem = [[NSMenuItem alloc] initWithTitle:@"连接详情" action:@selector(toggleOverlay) keyEquivalent:@""];
     detailsItem.target = self;
     detailsItem.state = self.overlayContainer ? NSControlStateValueOn : NSControlStateValueOff;
+    [self applyConfigurableShortcutToMenuItem:detailsItem
+                                    baseTitle:@"连接详情"
+                                       action:StreamShortcutActionToggleConnectionDetails];
     setSymbol(detailsItem, @"gauge.with.dots.needle.33percent");
     [windowMenu addItem:detailsItem];
 
@@ -2862,6 +2927,9 @@ highFreqMotor:(unsigned short)highFreqMotor {
     NSMenuItem *disconnectItem = [[NSMenuItem alloc] initWithTitle:@"退出串流" action:@selector(performCloseStreamWindow:) keyEquivalent:@"w"];
     disconnectItem.keyEquivalentModifierMask = NSEventModifierFlagCommand;
     disconnectItem.target = self;
+    [self applySecondaryShortcutDisplayToMenuItem:disconnectItem
+                                        baseTitle:@"退出串流"
+                                           action:StreamShortcutActionDisconnectStream];
     setSymbol(disconnectItem, @"xmark.circle");
     [self.streamMenu addItem:disconnectItem];
 }
@@ -3203,6 +3271,10 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 
 - (void)toggleFullscreenControlBallFromMenu:(NSMenuItem *)sender {
     [self toggleFullscreenControlBallVisibility];
+}
+
+- (void)toggleBorderlessWindowFromMenu:(id)sender {
+    [self handleConfiguredStreamShortcutAction:StreamShortcutActionToggleBorderlessWindow source:@"menu-toggle-borderless"];
 }
 
 - (void)toggleFullscreenControlBallVisibility {
@@ -3758,8 +3830,8 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     }
 
     uint64_t now = [self nowMs];
-    if (self.lastOptionUncaptureAtMs > 0 && now >= self.lastOptionUncaptureAtMs && (now - self.lastOptionUncaptureAtMs) <= 2500) {
-        source = [source stringByAppendingString:@"+after-option-uncapture"];
+    if (self.lastReleaseMouseShortcutAtMs > 0 && now >= self.lastReleaseMouseShortcutAtMs && (now - self.lastReleaseMouseShortcutAtMs) <= 2500) {
+        source = [source stringByAppendingString:@"+after-release-mouse-shortcut"];
     }
 
     return source;

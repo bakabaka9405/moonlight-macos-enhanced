@@ -167,6 +167,26 @@ public class LanguageManager: NSObject, ObservableObject {
     "MFi": "MFi",
     "Keyboard": "Keyboard",
     "Capture system keyboard shortcuts": "Capture system keyboard shortcuts",
+    "Streaming Shortcuts": "Streaming Shortcuts",
+    "Streaming shortcuts apply globally to all hosts.":
+      "Streaming shortcuts apply globally to all hosts.",
+    "Release Mouse": "Release Mouse",
+    "Open Control Center": "Open Control Center",
+    "Disconnect Stream": "Disconnect Stream",
+    "Toggle Connection Details": "Toggle Connection Details",
+    "Toggle Mouse Mode": "Toggle Mouse Mode",
+    "Toggle Fullscreen Control Ball": "Toggle Fullscreen Control Ball",
+    "Toggle Borderless Window": "Toggle Borderless Window",
+    "Restore Defaults": "Restore Defaults",
+    "Clear": "Clear",
+    "Unassigned": "Unassigned",
+    "Type shortcut": "Type shortcut",
+    "Press the shortcut, or press Esc to cancel.":
+      "Press the shortcut, or press Esc to cancel.",
+    "Shortcut Conflict: %@": "Shortcut already used by %@.",
+    "Shortcut is reserved by the app or system.":
+      "Shortcut is reserved by the app or system.",
+    "Failed to save shortcut.": "Failed to save shortcut.",
 
     "Mouse": "Mouse",
     "Optimize mouse for remote desktop": "Optimize mouse for remote desktop",
@@ -351,6 +371,26 @@ public class LanguageManager: NSObject, ObservableObject {
     "MFi": "MFi (原生)",
     "Keyboard": "键盘",
     "Capture system keyboard shortcuts": "捕获系统快捷键",
+    "Streaming Shortcuts": "串流快捷键",
+    "Streaming shortcuts apply globally to all hosts.":
+      "串流快捷键对所有主机全局生效。",
+    "Release Mouse": "释放鼠标",
+    "Open Control Center": "打开控制中心",
+    "Disconnect Stream": "断开串流",
+    "Toggle Connection Details": "切换连接详情",
+    "Toggle Mouse Mode": "切换鼠标模式",
+    "Toggle Fullscreen Control Ball": "切换全屏悬浮球",
+    "Toggle Borderless Window": "切换无边框窗口",
+    "Restore Defaults": "恢复默认",
+    "Clear": "清空",
+    "Unassigned": "未分配",
+    "Type shortcut": "请输入快捷键",
+    "Press the shortcut, or press Esc to cancel.":
+      "按下快捷键，或按 Esc 取消。",
+    "Shortcut Conflict: %@": "该快捷键已被“%@”占用。",
+    "Shortcut is reserved by the app or system.":
+      "该快捷键已被应用或系统保留。",
+    "Failed to save shortcut.": "保存快捷键失败。",
 
     "Visuals": "界面",
     "Dim Non-Hovered Apps": "调暗未选中应用封面",
