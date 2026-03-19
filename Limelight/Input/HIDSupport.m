@@ -894,21 +894,25 @@ static CVReturn displayLinkOutputCallback(CVDisplayLinkRef displayLink,
 }
 
 - (void)mouseMoved:(NSEvent *)event {
-    if (self.useGCMouse) {
+    static float remainX=0, remainY=0;
+    BOOL absoluteMouse = [SettingsClass absoluteMouseModeFor:self.host.uuid];
+    NSInteger touchscreenMode = [SettingsClass touchscreenModeFor:self.host.uuid];
+    BOOL usesAbsolutePointer = absoluteMouse || touchscreenMode == 1;
+
+    // In absolute-position modes, prefer AppKit window coordinates even when
+    // the mouse driver is backed by GCMouse, because the GCMouse API only
+    // exposes deltas and would otherwise suppress movement entirely.
+    if (self.useGCMouse && !usesAbsolutePointer) {
         return;
     }
-
-    static float remainX=0,remainY=0;
     
     if (self.shouldSendInputEvents) {
         PML_INPUT_STREAM_CONTEXT inputCtx = HIDInputContext(self);
         if (!HIDValidateInputContext(inputCtx, "mouseMoved")) {
             return;
         }
-        BOOL absoluteMouse = [SettingsClass absoluteMouseModeFor:self.host.uuid];
-        NSInteger touchscreenMode = [SettingsClass touchscreenModeFor:self.host.uuid];
         
-        if (absoluteMouse || touchscreenMode == 1) {
+        if (usesAbsolutePointer) {
             NSPoint loc = [event locationInWindow];
             NSSize size = event.window.contentView.frame.size;
             // Invert Y for top-left origin

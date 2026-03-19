@@ -3346,7 +3346,10 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     NSDictionary* prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
     BOOL showLocalCursor = prefs ? [prefs[@"showLocalCursor"] boolValue] : NO;
     NSString *mouseMode = [SettingsClass mouseModeFor:self.app.host.uuid];
-    self.isRemoteDesktopMode = [mouseMode isEqualToString:@"remote"];
+    BOOL absoluteMouse = [SettingsClass absoluteMouseModeFor:self.app.host.uuid];
+    NSInteger touchscreenMode = [SettingsClass touchscreenModeFor:self.app.host.uuid];
+    BOOL usesAbsolutePointer = absoluteMouse || touchscreenMode == 1;
+    self.isRemoteDesktopMode = [mouseMode isEqualToString:@"remote"] || usesAbsolutePointer;
 
     // Hide system cursor in both game mode and remote desktop mode (unless showLocalCursor is enabled)
     if (!showLocalCursor) {
