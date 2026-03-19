@@ -5,3 +5,6 @@ DerivedData
 Limelight/Version.xcconfig
 .reference/
 .DS_Store
+Package.swift
+Package.resolved
+.build

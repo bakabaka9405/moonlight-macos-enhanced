@@ -1323,6 +1323,17 @@ highFreqMotor:(unsigned short)highFreqMotor {
     __weak typeof(self) weakSelf = self;
     self.settingsDidChangeObserver = [[NSNotificationCenter defaultCenter] addObserverForName:NSUserDefaultsDidChangeNotification object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         [weakSelf updateWindowSubtitle];
+        if (!weakSelf) {
+            return;
+        }
+        NSWindow *window = weakSelf.view.window;
+        NSScreen *screen = window.screen;
+        if (window && screen) {
+            [weakSelf applyCursorCaptureStateForWindow:window screen:screen];
+        } else {
+            [weakSelf restoreSystemCursorVisibilityIfNeeded];
+            CGAssociateMouseAndMouseCursorPosition(YES);
+        }
     }];
     self.hostLatencyUpdatedObserver = [[NSNotificationCenter defaultCenter] addObserverForName:@"HostLatencyUpdated" object:nil queue:[NSOperationQueue mainQueue] usingBlock:^(NSNotification *note) {
         [weakSelf updateWindowSubtitle];
@@ -3312,6 +3323,55 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     [self toggleMouseMode];
 }
 
+- (BOOL)showLocalCursorEnabledForCurrentHost {
+    NSDictionary *prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
+    return prefs ? [prefs[@"showLocalCursor"] boolValue] : NO;
+}
+
+- (void)refreshMouseModeStateForCurrentHost {
+    NSString *mouseMode = [SettingsClass mouseModeFor:self.app.host.uuid];
+    BOOL absoluteMouse = [SettingsClass absoluteMouseModeFor:self.app.host.uuid];
+    NSInteger touchscreenMode = [SettingsClass touchscreenModeFor:self.app.host.uuid];
+    BOOL usesAbsolutePointer = absoluteMouse || touchscreenMode == 1;
+    self.isRemoteDesktopMode = [mouseMode isEqualToString:@"remote"] || usesAbsolutePointer;
+}
+
+- (void)restoreSystemCursorVisibilityIfNeeded {
+    while (self.cursorHiddenCounter > 0) {
+        [NSCursor unhide];
+        self.cursorHiddenCounter--;
+    }
+}
+
+- (void)applyCursorCaptureStateForWindow:(NSWindow *)window screen:(NSScreen *)screen {
+    [self refreshMouseModeStateForCurrentHost];
+
+    BOOL showLocalCursor = [self showLocalCursorEnabledForCurrentHost];
+    BOOL shouldHideLocalCursor = self.isMouseCaptured && !showLocalCursor;
+    BOOL shouldDisassociateMouse = shouldHideLocalCursor && !self.isRemoteDesktopMode;
+
+    if (shouldHideLocalCursor) {
+        if (self.cursorHiddenCounter == 0) {
+            [NSCursor hide];
+            self.cursorHiddenCounter++;
+        }
+    } else {
+        [self restoreSystemCursorVisibilityIfNeeded];
+    }
+
+    CGAssociateMouseAndMouseCursorPosition(!shouldDisassociateMouse);
+
+    if (shouldDisassociateMouse && window && screen) {
+        CGRect rectInWindow = [self.view convertRect:self.view.bounds toView:nil];
+        CGRect rectInScreen = [window convertRectToScreen:rectInWindow];
+        CGFloat screenHeight = screen.frame.size.height;
+        if (screenHeight > 0) {
+            CGPoint cursorPoint = CGPointMake(CGRectGetMidX(rectInScreen), screenHeight - CGRectGetMidY(rectInScreen));
+            CGWarpMouseCursorPosition(cursorPoint);
+        }
+    }
+}
+
 - (void)captureMouse {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -3343,33 +3403,8 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
         return;
     }
 
-    NSDictionary* prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
-    BOOL showLocalCursor = prefs ? [prefs[@"showLocalCursor"] boolValue] : NO;
-    NSString *mouseMode = [SettingsClass mouseModeFor:self.app.host.uuid];
-    BOOL absoluteMouse = [SettingsClass absoluteMouseModeFor:self.app.host.uuid];
-    NSInteger touchscreenMode = [SettingsClass touchscreenModeFor:self.app.host.uuid];
-    BOOL usesAbsolutePointer = absoluteMouse || touchscreenMode == 1;
-    self.isRemoteDesktopMode = [mouseMode isEqualToString:@"remote"] || usesAbsolutePointer;
-
-    // Hide system cursor in both game mode and remote desktop mode (unless showLocalCursor is enabled)
-    if (!showLocalCursor) {
-        if (self.cursorHiddenCounter == 0) {
-            [NSCursor hide];
-            self.cursorHiddenCounter++;
-        }
-        // In game mode, also disassociate mouse from cursor position
-        if (!self.isRemoteDesktopMode) {
-            CGAssociateMouseAndMouseCursorPosition(NO);
-            CGRect rectInWindow = [self.view convertRect:self.view.bounds toView:nil];
-            CGRect rectInScreen = [window convertRectToScreen:rectInWindow];
-            CGFloat screenHeight = screen.frame.size.height;
-            if (screenHeight <= 0) {
-                return;
-            }
-            CGPoint cursorPoint = CGPointMake(CGRectGetMidX(rectInScreen), screenHeight - CGRectGetMidY(rectInScreen));
-            CGWarpMouseCursorPosition(cursorPoint);
-        }
-    }
+    self.isMouseCaptured = YES;
+    [self applyCursorCaptureStateForWindow:window screen:screen];
 
     [self enableMenuItems:NO];
 
@@ -3379,8 +3414,6 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     self.hidSupport.shouldSendInputEvents = YES;
     self.controllerSupport.shouldSendInputEvents = YES;
     self.view.window.acceptsMouseMovedEvents = YES;
-
-    self.isMouseCaptured = YES;
 }
 
 - (void)uncaptureMouse {
@@ -3398,16 +3431,8 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
         return;
     }
 
-    NSDictionary* prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
-    BOOL showLocalCursor = prefs ? [prefs[@"showLocalCursor"] boolValue] : NO;
-
-    if (!showLocalCursor) {
-        CGAssociateMouseAndMouseCursorPosition(YES);
-        if (self.cursorHiddenCounter != 0) {
-            [NSCursor unhide];
-            self.cursorHiddenCounter --;
-        }
-    }
+    [self restoreSystemCursorVisibilityIfNeeded];
+    CGAssociateMouseAndMouseCursorPosition(YES);
     
     [self enableMenuItems:YES];
     
