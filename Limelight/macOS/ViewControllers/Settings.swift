@@ -10,6 +10,11 @@ import AppKit
 import CoreGraphics
 import SwiftUI
 
+enum SettingsProfileSource: String, CaseIterable {
+  case global
+  case independent
+}
+
 struct Settings: Encodable, Decodable {
   let resolution: CGSize
   let matchDisplayResolution: Bool?
@@ -73,25 +78,89 @@ struct Settings: Encodable, Decodable {
   let upscalingMode: Int?
   let connectionMethod: String?
 
-  private static func globalProfileKey() -> String {
-    SettingsClass.profileKey(for: SettingsModel.globalHostId)
-  }
-
-  static func getSettings(for key: String) -> Self? {
+  static func storedSettings(for key: String) -> Self? {
     if let data = UserDefaults.standard.data(forKey: SettingsClass.profileKey(for: key)) {
       if let settings = (try? PropertyListDecoder().decode(Settings.self, from: data)) ?? nil {
         return settings
       }
     }
 
-    // Fallback to global settings when no host-specific settings exist
-    if let data = UserDefaults.standard.data(forKey: globalProfileKey()) {
-      if let settings = (try? PropertyListDecoder().decode(Settings.self, from: data)) ?? nil {
-        return settings
-      }
-    }
-
     return nil
+  }
+
+  static func defaultSettings() -> Self {
+    let bitrate = SettingsModel.getDefaultBitrateKbps(
+      width: Int(SettingsModel.defaultResolution.width),
+      height: Int(SettingsModel.defaultResolution.height),
+      fps: SettingsModel.defaultFps,
+      yuv444: SettingsModel.defaultEnableYUV444
+    )
+
+    return Settings(
+      resolution: SettingsModel.defaultResolution,
+      matchDisplayResolution: false,
+      customResolution: nil,
+      fps: SettingsModel.defaultFps,
+      customFps: SettingsModel.defaultCustomFps,
+      autoAdjustBitrate: SettingsModel.defaultAutoAdjustBitrate,
+      enableYUV444: SettingsModel.defaultEnableYUV444,
+      ignoreAspectRatio: SettingsModel.defaultIgnoreAspectRatio,
+      showLocalCursor: SettingsModel.defaultShowLocalCursor,
+      enableMicrophone: SettingsModel.defaultEnableMicrophone,
+      streamResolutionScale: SettingsModel.defaultStreamResolutionScale,
+      streamResolutionScaleRatio: SettingsModel.defaultStreamResolutionScaleRatio,
+      remoteResolution: SettingsModel.defaultRemoteResolutionEnabled,
+      remoteResolutionWidth: nil,
+      remoteResolutionHeight: nil,
+      remoteFps: SettingsModel.defaultRemoteFpsEnabled,
+      remoteFpsRate: nil,
+      bitrate: bitrate,
+      customBitrate: nil,
+      unlockMaxBitrate: SettingsModel.defaultUnlockMaxBitrate,
+      codec: SettingsModel.getInt(from: SettingsModel.defaultVideoCodec, in: SettingsModel.videoCodecs),
+      hdr: SettingsModel.defaultHdr,
+      framePacing: SettingsModel.getInt(
+        from: SettingsModel.defaultPacingOptions, in: SettingsModel.pacingOptions),
+      audioOnPC: SettingsModel.defaultAudioOnPC,
+      audioConfiguration: SettingsModel.getInt(
+        from: SettingsModel.defaultAudioConfiguration, in: SettingsModel.audioConfigurations),
+      enableVsync: SettingsModel.defaultEnableVsync,
+      showPerformanceOverlay: SettingsModel.defaultShowPerformanceOverlay,
+      showConnectionWarnings: SettingsModel.defaultShowConnectionWarnings,
+      captureSystemShortcuts: SettingsModel.defaultCaptureSystemShortcuts,
+      volumeLevel: SettingsModel.defaultVolumeLevel,
+      multiController: SettingsModel.getBool(
+        from: SettingsModel.defaultMultiControllerMode, in: SettingsModel.multiControllerModes),
+      swapABXYButtons: SettingsModel.defaultSwapButtons,
+      optimize: SettingsModel.defaultOptimize,
+      autoFullscreen: SettingsModel.defaultAutoFullscreen,
+      displayMode: SettingsModel.defaultDisplayMode,
+      rumble: SettingsModel.defaultRumble,
+      controllerDriver: SettingsModel.getInt(
+        from: SettingsModel.defaultControllerDriver, in: SettingsModel.controllerDrivers),
+      mouseDriver: SettingsModel.getInt(
+        from: SettingsModel.defaultMouseDriver, in: SettingsModel.mouseDrivers),
+      emulateGuide: SettingsModel.defaultEmulateGuide,
+      appArtworkDimensions: nil,
+      dimNonHoveredArtwork: SettingsModel.defaultDimNonHoveredArtwork,
+      quitAppAfterStream: SettingsModel.defaultQuitAppAfterStream,
+      absoluteMouseMode: SettingsModel.defaultAbsoluteMouseMode,
+      swapMouseButtons: SettingsModel.defaultSwapMouseButtons,
+      reverseScrollDirection: SettingsModel.defaultReverseScrollDirection,
+      touchscreenMode: SettingsModel.defaultTouchscreenMode,
+      gamepadMouseMode: SettingsModel.defaultGamepadMouseMode,
+      mouseMode: SettingsModel.getInt(from: SettingsModel.defaultMouseMode, in: SettingsModel.mouseModes),
+      upscalingMode: SettingsModel.defaultUpscalingMode,
+      connectionMethod: "Auto"
+    )
+  }
+
+  static func effectiveSettings(for key: String) -> Self? {
+    SettingsClass.effectiveSettings(for: key)
+  }
+
+  static func getSettings(for key: String) -> Self? {
+    effectiveSettings(for: key)
   }
 }
 
@@ -102,10 +171,114 @@ class SettingsClass: NSObject {
     return profileKey
   }
 
-  private static func persist(_ settings: Settings, for key: String) {
+  static func profileSourceKey(for hostId: String) -> String {
+    let profileSourceKey = "\(hostId)-moonlightSettingsSource"
+
+    return profileSourceKey
+  }
+
+  static func storeSettings(_ settings: Settings, for key: String) {
     if let data = try? PropertyListEncoder().encode(settings) {
       UserDefaults.standard.set(data, forKey: SettingsClass.profileKey(for: key))
     }
+  }
+
+  static func storedSettings(for key: String) -> Settings? {
+    Settings.storedSettings(for: key)
+  }
+
+  @discardableResult
+  static func ensureGlobalSettings() -> Settings {
+    if let settings = storedSettings(for: SettingsModel.globalHostId) {
+      return settings
+    }
+
+    let defaults = Settings.defaultSettings()
+    storeSettings(defaults, for: SettingsModel.globalHostId)
+    return defaults
+  }
+
+  static func effectiveSettings(for key: String) -> Settings? {
+    if key == SettingsModel.globalHostId {
+      return storedSettings(for: key) ?? ensureGlobalSettings()
+    }
+
+    switch profileSource(for: key) {
+    case .global:
+      return storedSettings(for: SettingsModel.globalHostId) ?? ensureGlobalSettings()
+    case .independent:
+      return storedSettings(for: key)
+        ?? storedSettings(for: SettingsModel.globalHostId)
+        ?? ensureGlobalSettings()
+    }
+  }
+
+  static func profileSource(for key: String) -> SettingsProfileSource {
+    // The global profile is always directly editable and never follows another profile.
+    if key == SettingsModel.globalHostId {
+      return .independent
+    }
+
+    if let rawSource = UserDefaults.standard.string(forKey: profileSourceKey(for: key)),
+      let source = SettingsProfileSource(rawValue: rawSource)
+    {
+      return source
+    }
+
+    return storedSettings(for: key) != nil ? .independent : .global
+  }
+
+  static func setProfileSource(_ source: SettingsProfileSource, for key: String) {
+    guard key != SettingsModel.globalHostId else { return }
+    UserDefaults.standard.set(source.rawValue, forKey: profileSourceKey(for: key))
+  }
+
+  static func hasStoredIndependentSettings(for key: String) -> Bool {
+    guard key != SettingsModel.globalHostId else { return false }
+    return storedSettings(for: key) != nil
+  }
+
+  @discardableResult
+  static func cloneGlobalSettings(to key: String) -> Settings {
+    let settings = storedSettings(for: SettingsModel.globalHostId) ?? ensureGlobalSettings()
+    storeSettings(settings, for: key)
+    return settings
+  }
+
+  @discardableResult
+  static func resetIndependentSettingsToDefaults(for key: String) -> Settings {
+    let defaults = Settings.defaultSettings()
+    storeSettings(defaults, for: key)
+    return defaults
+  }
+
+  @discardableResult
+  static func ensureIndependentSettingsSeeded(for key: String) -> Settings {
+    if let settings = storedSettings(for: key) {
+      return settings
+    }
+
+    return cloneGlobalSettings(to: key)
+  }
+
+  @objc static func isSettingsEditable(for key: String) -> Bool {
+    key == SettingsModel.globalHostId || profileSource(for: key) == .independent
+  }
+
+  @objc static func isUsingGlobalSettings(for key: String) -> Bool {
+    key != SettingsModel.globalHostId && profileSource(for: key) == .global
+  }
+
+  private static func editableSettings(for key: String) -> Settings? {
+    if key == SettingsModel.globalHostId {
+      return storedSettings(for: key) ?? ensureGlobalSettings()
+    }
+
+    guard profileSource(for: key) == .independent else {
+      return nil
+    }
+
+    return ensureIndependentSettingsSeeded(for: key)
   }
 
   private static func copy(
@@ -194,7 +367,7 @@ class SettingsClass: NSObject {
   }
 
   @objc static func getSettings(for key: String) -> [String: Any]? {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       let objcSettings: [String: Any?] = [
         "resolution": settings.resolution,
         "matchDisplayResolution": settings.matchDisplayResolution,
@@ -256,12 +429,12 @@ class SettingsClass: NSObject {
   }
 
   @objc static func setConnectionMethod(_ method: String, for key: String) {
-    guard let settings = Settings.getSettings(for: key) else {
+    guard let settings = editableSettings(for: key) else {
       return
     }
 
     let updated = copy(settings, connectionMethod: method)
-    persist(updated, for: key)
+    storeSettings(updated, for: key)
   }
 
   // Menu-driven bitrate choice.
@@ -270,20 +443,20 @@ class SettingsClass: NSObject {
   @objc static func setBitrateMode(
     _ autoAdjust: Bool, customBitrateKbps: NSNumber?, for key: String
   ) {
-    guard let settings = Settings.getSettings(for: key) else {
+    guard let settings = editableSettings(for: key) else {
       return
     }
 
     if autoAdjust {
       let updated = copy(settings, autoAdjustBitrate: true, customBitrate: .some(nil))
-      persist(updated, for: key)
+      storeSettings(updated, for: key)
       return
     }
 
     let kbps = max(0, customBitrateKbps?.intValue ?? settings.bitrate)
     let updated = copy(
       settings, autoAdjustBitrate: false, bitrate: kbps, customBitrate: .some(kbps))
-    persist(updated, for: key)
+    storeSettings(updated, for: key)
   }
 
   // Menu-driven resolution/fps choice.
@@ -293,7 +466,7 @@ class SettingsClass: NSObject {
   @objc static func setResolutionAndFps(
     _ width: Int, _ height: Int, _ fps: Int, matchDisplay: Bool, for key: String
   ) {
-    guard let settings = Settings.getSettings(for: key) else { return }
+    guard let settings = editableSettings(for: key) else { return }
 
     let newRes =
       matchDisplay
@@ -420,13 +593,13 @@ class SettingsClass: NSObject {
       )
     }
 
-    persist(updated, for: key)
+    storeSettings(updated, for: key)
   }
 
   @objc static func setCustomResolution(
     _ width: Int, _ height: Int, _ fps: Int, for key: String
   ) {
-    guard let settings = Settings.getSettings(for: key) else { return }
+    guard let settings = editableSettings(for: key) else { return }
 
     let updated = Settings(
       resolution: .zero,  // Sentinel for custom
@@ -494,11 +667,11 @@ class SettingsClass: NSObject {
       // Leaving this block empty as the original implementation did not persist changes.
     }
 
-    persist(updated, for: key)
+    storeSettings(updated, for: key)
   }
 
   @objc static func applyStreamRecommendation(_ recommendation: StreamRiskRecommendation, for key: String) {
-    guard let settings = Settings.getSettings(for: key) else {
+    guard let settings = editableSettings(for: key) else {
       return
     }
 
@@ -531,24 +704,24 @@ class SettingsClass: NSObject {
       hdr: codec == 1 ? settings.hdr : false
     )
 
-    persist(updated, for: key)
+    storeSettings(updated, for: key)
   }
 
   @objc static func setVolumeLevel(_ level: CGFloat, for key: String) {
-    guard let settings = Settings.getSettings(for: key) else {
+    guard let settings = editableSettings(for: key) else {
       return
     }
 
     let clamped = min(1.0, max(0.0, level))
     let updated = copy(settings, volumeLevel: clamped)
-    persist(updated, for: key)
+    storeSettings(updated, for: key)
 
     // Keep behavior aligned with SettingsModel (Connection listens for this).
     NotificationCenter.default.post(name: Notification.Name("volumeSettingChanged"), object: nil)
   }
 
   @objc static func loadMoonlightSettings(for key: String) {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       let dataMan = DataManager()
 
       func displayPixelSize() -> CGSize? {
@@ -666,7 +839,7 @@ class SettingsClass: NSObject {
   }
 
   @objc static func autoFullscreen(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.autoFullscreen
     }
 
@@ -674,7 +847,7 @@ class SettingsClass: NSObject {
   }
 
   @objc static func displayMode(for key: String) -> Int {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       if let mode = settings.displayMode {
         return mode
       }
@@ -685,7 +858,7 @@ class SettingsClass: NSObject {
   }
 
   @objc static func rumble(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.rumble
     }
 
@@ -693,7 +866,7 @@ class SettingsClass: NSObject {
   }
 
   @objc static func controllerDriver(for key: String) -> Int {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.controllerDriver
     }
 
@@ -702,7 +875,7 @@ class SettingsClass: NSObject {
   }
 
   @objc static func mouseDriver(for key: String) -> Int {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.mouseDriver
     }
 
@@ -711,7 +884,7 @@ class SettingsClass: NSObject {
   }
 
   @objc static func mouseMode(for key: String) -> String {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       if let mode = settings.mouseMode {
         return SettingsModel.getString(from: mode, in: SettingsModel.mouseModes)
       }
@@ -720,15 +893,15 @@ class SettingsClass: NSObject {
   }
 
   @objc static func setMouseMode(_ mode: String, for key: String) {
-    guard let settings = Settings.getSettings(for: key) else { return }
+    guard let settings = editableSettings(for: key) else { return }
 
     let modeVal = SettingsModel.getInt(from: mode, in: SettingsModel.mouseModes)
     let updated = copy(settings, mouseMode: modeVal)
-    persist(updated, for: key)
+    storeSettings(updated, for: key)
   }
 
   @objc static func appArtworkDimensions(for key: String) -> CGSize {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       if let dimensions = settings.appArtworkDimensions {
         return dimensions
       }
@@ -738,7 +911,7 @@ class SettingsClass: NSObject {
   }
 
   @objc static func dimNonHoveredArtwork(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.dimNonHoveredArtwork
     }
 
@@ -746,7 +919,7 @@ class SettingsClass: NSObject {
   }
 
   @objc static func volumeLevel(for key: String) -> CGFloat {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.volumeLevel ?? SettingsModel.defaultVolumeLevel
     }
 
@@ -754,21 +927,21 @@ class SettingsClass: NSObject {
   }
 
   @objc static func audioConfiguration(for key: String) -> Int {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.audioConfiguration
     }
     return 0  // Stereo default
   }
 
   @objc static func enableVsync(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.enableVsync ?? SettingsModel.defaultEnableVsync
     }
     return SettingsModel.defaultEnableVsync
   }
 
   @objc static func framePacing(for key: String) -> Int {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.framePacing
     }
     return SettingsModel.getInt(
@@ -776,70 +949,70 @@ class SettingsClass: NSObject {
   }
 
   @objc static func showPerformanceOverlay(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.showPerformanceOverlay ?? SettingsModel.defaultShowPerformanceOverlay
     }
     return SettingsModel.defaultShowPerformanceOverlay
   }
 
   @objc static func showConnectionWarnings(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.showConnectionWarnings ?? SettingsModel.defaultShowConnectionWarnings
     }
     return SettingsModel.defaultShowConnectionWarnings
   }
 
   @objc static func captureSystemShortcuts(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.captureSystemShortcuts ?? SettingsModel.defaultCaptureSystemShortcuts
     }
     return SettingsModel.defaultCaptureSystemShortcuts
   }
 
   @objc static func quitAppAfterStream(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.quitAppAfterStream ?? SettingsModel.defaultQuitAppAfterStream
     }
     return SettingsModel.defaultQuitAppAfterStream
   }
 
   @objc static func absoluteMouseMode(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.absoluteMouseMode ?? SettingsModel.defaultAbsoluteMouseMode
     }
     return SettingsModel.defaultAbsoluteMouseMode
   }
 
   @objc static func swapMouseButtons(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.swapMouseButtons ?? SettingsModel.defaultSwapMouseButtons
     }
     return SettingsModel.defaultSwapMouseButtons
   }
 
   @objc static func reverseScrollDirection(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.reverseScrollDirection ?? SettingsModel.defaultReverseScrollDirection
     }
     return SettingsModel.defaultReverseScrollDirection
   }
 
   @objc static func touchscreenMode(for key: String) -> Int {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.touchscreenMode ?? SettingsModel.defaultTouchscreenMode
     }
     return SettingsModel.defaultTouchscreenMode
   }
 
   @objc static func gamepadMouseMode(for key: String) -> Bool {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.gamepadMouseMode ?? SettingsModel.defaultGamepadMouseMode
     }
     return SettingsModel.defaultGamepadMouseMode
   }
 
   @objc static func upscalingMode(for key: String) -> Int {
-    if let settings = Settings.getSettings(for: key) {
+    if let settings = effectiveSettings(for: key) {
       return settings.upscalingMode ?? SettingsModel.defaultUpscalingMode
     }
     return SettingsModel.defaultUpscalingMode

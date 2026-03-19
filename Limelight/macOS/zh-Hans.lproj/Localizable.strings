@@ -7,6 +7,20 @@
 
 /* Toolbar */
 "Profile:" = "配置文件:";
+"Settings Profile" = "配置文件";
+"Global (Default)" = "全局（默认）";
+"Scope: Global" = "作用域：全局";
+"Settings Scope" = "设置作用域";
+"Use Global Settings" = "使用全局设置";
+"Use Independent Settings" = "使用独立设置";
+"Following global settings. Controls below are read-only." = "当前跟随全局设置，以下控件只读。";
+"Using independent settings for this host." = "当前使用该主机的独立设置。";
+"Independent snapshot saved." = "已保存独立副本。";
+"Independent snapshot not created yet." = "尚未创建独立副本。";
+"Independent Snapshot" = "独立副本";
+"Clone From Global" = "从全局设置克隆";
+"Reset Independent Settings" = "恢复独立设置为默认";
+"Reset Independent Settings Confirm Message" = "此操作会用应用默认值覆盖该主机保存的独立设置，但不会切换当前作用域。";
 
 /* Stream Settings */
 "Resolution and FPS" = "分辨率与帧率";

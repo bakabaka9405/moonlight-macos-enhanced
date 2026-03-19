@@ -7,6 +7,20 @@
 
 /* Toolbar */
 "Profile:" = "Profile:";
+"Settings Profile" = "Settings Profile";
+"Global (Default)" = "Global (Default)";
+"Scope: Global" = "Scope: Global";
+"Settings Scope" = "Settings Scope";
+"Use Global Settings" = "Use Global Settings";
+"Use Independent Settings" = "Use Independent Settings";
+"Following global settings. Controls below are read-only." = "Following global settings. Controls below are read-only.";
+"Using independent settings for this host." = "Using independent settings for this host.";
+"Independent snapshot saved." = "Independent snapshot saved.";
+"Independent snapshot not created yet." = "Independent snapshot not created yet.";
+"Independent Snapshot" = "Independent Snapshot";
+"Clone From Global" = "Clone From Global";
+"Reset Independent Settings" = "Reset Independent Settings";
+"Reset Independent Settings Confirm Message" = "This will overwrite the host's saved independent settings with app defaults. The current scope will not change.";
 
 /* Stream Settings */
 "Resolution and FPS" = "Resolution and FPS";

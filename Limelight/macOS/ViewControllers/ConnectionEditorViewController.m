@@ -235,6 +235,8 @@
     NSString *currentMethod = prefs[@"connectionMethod"] ?: @"Auto";
     NSInteger currentIdx = [self indexOfPopup:self.currentPopup forValue:currentMethod fallback:@"Auto"];
     [self.currentPopup selectItemAtIndex:currentIdx];
+
+    self.currentPopup.enabled = [SettingsClass isSettingsEditableFor:self.host.uuid];
 }
 
 - (NSInteger)indexOfPopup:(NSPopUpButton *)popup forValue:(NSString *)value fallback:(NSString *)fallback {
@@ -390,6 +392,10 @@
 }
 
 - (void)currentMethodChanged:(NSPopUpButton *)sender {
+    if (![SettingsClass isSettingsEditableFor:self.host.uuid]) {
+        return;
+    }
+
     NSString *value = sender.selectedItem.representedObject ?: @"Auto";
     [SettingsClass setConnectionMethod:value for:self.host.uuid];
     [[NSNotificationCenter defaultCenter] postNotificationName:@"ConnectionMethodUpdated"

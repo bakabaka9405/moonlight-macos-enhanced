@@ -1128,6 +1128,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)handleRecommendedProfileSelection:(NSMenuItem *)item {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     StreamRiskRecommendation *recommendation = item.representedObject;
     if (recommendation == nil) {
         return;
@@ -2479,6 +2483,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
 
     // 一级顶部：鼠标模式切换
     NSDictionary *prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
+    BOOL hostSettingsEditable = [SettingsClass isSettingsEditableFor:self.app.host.uuid];
     NSString *mouseMode = [SettingsClass mouseModeFor:self.app.host.uuid];
     BOOL isRemoteMode = [mouseMode isEqualToString:@"remote"];
 
@@ -2490,6 +2495,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
                                     baseTitle:(isRemoteMode ? @"远控模式" : @"游戏模式")
                                        action:StreamShortcutActionToggleMouseMode];
     setSymbol(mouseModeItem, isRemoteMode ? @"desktopcomputer" : @"gamecontroller");
+    mouseModeItem.enabled = hostSettingsEditable;
     [self.streamMenu addItem:mouseModeItem];
 
     // 一级顶部：重连
@@ -2589,6 +2595,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     matchDisplayItem.state = isMatchDisplay ? NSControlStateValueOn : NSControlStateValueOff;
 
     setSymbol(matchDisplayItem, @"macwindow.badge.plus");
+    matchDisplayItem.enabled = hostSettingsEditable;
     [monitorMenu addItem:matchDisplayItem];
 
     struct Resolution currentRes = [self.class getResolution];
@@ -2616,6 +2623,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     NSMenuItem *customItem = [[NSMenuItem alloc] initWithTitle:@"自定义..." action:@selector(selectCustomResolutionFromMenu:) keyEquivalent:@""];
     customItem.target = self;
     setSymbol(customItem, @"slider.horizontal.below.rectangle");
+    customItem.enabled = hostSettingsEditable;
     [monitorMenu addItem:customItem];
 
     [monitorMenu addItem:[NSMenuItem separatorItem]];
@@ -2644,6 +2652,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
         
         BOOL selected = (!isMatchDisplay && !isMatchHost && currentRes.width == (int)size.width && currentRes.height == (int)size.height);
         item.state = selected ? NSControlStateValueOn : NSControlStateValueOff;
+        item.enabled = hostSettingsEditable;
         
         [monitorMenu addItem:item];
     }
@@ -2674,6 +2683,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
         
         BOOL selected = (currentFps == fps.intValue);
         item.state = selected ? NSControlStateValueOn : NSControlStateValueOff;
+        item.enabled = hostSettingsEditable;
         
         [fpsSubMenu addItem:item];
     }
@@ -2690,6 +2700,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
 
     NSMenuItem *customFpsItem = [[NSMenuItem alloc] initWithTitle:@"自定义..." action:@selector(selectCustomFpsFromMenu:) keyEquivalent:@""];
     customFpsItem.target = self;
+    customFpsItem.enabled = hostSettingsEditable;
     [fpsSubMenu addItem:customFpsItem];
     
     fpsSubItem.submenu = fpsSubMenu;
@@ -2717,6 +2728,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     autoBitrateItem.representedObject = @"auto";
     autoBitrateItem.state = autoAdjust ? NSControlStateValueOn : NSControlStateValueOff;
     setSymbol(autoBitrateItem, @"wand.and.stars");
+    autoBitrateItem.enabled = hostSettingsEditable;
     [qualityMenu addItem:autoBitrateItem];
 
     NSArray<NSNumber *> *bitrateMbpsChoices = @[ @5, @10, @20, @40, @80, @120, @200 ];
@@ -2731,6 +2743,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
         if (selected) isPresetSelected = YES;
         item.state = selected ? NSControlStateValueOn : NSControlStateValueOff;
         setSymbol(item, @"speedometer");
+        item.enabled = hostSettingsEditable;
         [qualityMenu addItem:item];
     }
 
@@ -2742,6 +2755,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     NSMenuItem *customBitrateItem = [[NSMenuItem alloc] initWithTitle:@"自定义" action:nil keyEquivalent:@""];
     customBitrateItem.state = isCustomMode ? NSControlStateValueOn : NSControlStateValueOff;
     setSymbol(customBitrateItem, @"slider.horizontal.3");
+    customBitrateItem.enabled = hostSettingsEditable;
 
     // 三级菜单：自定义码率
     NSMenu *customMenu = [[NSMenu alloc] initWithTitle:@"自定义"];
@@ -2786,6 +2800,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     self.menuBitrateSlider.action = @selector(handleBitrateSliderChanged:);
     self.menuBitrateSlider.continuous = YES;
     [self updateBitrateSliderPosition:displayKbps];
+    self.menuBitrateSlider.enabled = hostSettingsEditable;
     [bitrateView addSubview:self.menuBitrateSlider];
 
     // 手动输入框
@@ -2801,6 +2816,8 @@ highFreqMotor:(unsigned short)highFreqMotor {
     inputField.target = self;
     inputField.action = @selector(handleBitrateInputChanged:);
     inputField.tag = 1001; // 用于识别
+    inputField.editable = hostSettingsEditable;
+    inputField.selectable = hostSettingsEditable;
     [bitrateView addSubview:inputField];
 
     NSTextField *inputSuffix = [[NSTextField alloc] initWithFrame:NSMakeRect(80, 4, 40, 16)];
@@ -2820,6 +2837,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     applyButton.target = self;
     applyButton.action = @selector(handleBitrateApplyClicked:);
     applyButton.font = [NSFont systemFontOfSize:11 weight:NSFontWeightMedium];
+    applyButton.enabled = hostSettingsEditable;
     [bitrateView addSubview:applyButton];
 
     NSMenuItem *bitrateSliderItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
@@ -2857,6 +2875,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
         self.menuVolumeSlider.continuous = YES;
     }
     self.menuVolumeSlider.doubleValue = [SettingsClass volumeLevelFor:self.app.host.uuid];
+    self.menuVolumeSlider.enabled = hostSettingsEditable;
     [volView addSubview:self.menuVolumeSlider];
 
     NSMenuItem *volSliderItem = [[NSMenuItem alloc] initWithTitle:@"" action:nil keyEquivalent:@""];
@@ -2877,6 +2896,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     autoItem.representedObject = @"Auto";
     autoItem.state = [method isEqualToString:@"Auto"] ? NSControlStateValueOn : NSControlStateValueOff;
     setSymbol(autoItem, @"wand.and.stars");
+    autoItem.enabled = hostSettingsEditable;
     [networkMenu addItem:autoItem];
 
     NSArray<NSString *> *candidates = @[ self.app.host.localAddress ?: @"", self.app.host.address ?: @"", self.app.host.externalAddress ?: @"", self.app.host.ipv6Address ?: @"" ];
@@ -2894,6 +2914,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
             addrItem.representedObject = addr;
             addrItem.state = [method isEqualToString:addr] ? NSControlStateValueOn : NSControlStateValueOff;
             setSymbol(addrItem, @"link");
+            addrItem.enabled = hostSettingsEditable;
             [networkMenu addItem:addrItem];
         }
     }
@@ -2962,6 +2983,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)selectConnectionMethodFromMenu:(NSMenuItem *)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     NSString *method = (NSString *)sender.representedObject;
     if (method.length == 0) {
         return;
@@ -2980,6 +3005,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)selectFollowHostFromMenu:(id)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     // 0x0 resolution and 0 FPS usually signals "Native" or "Default" to the core library.
     // We treat this as "Follow Host".
     [SettingsClass setCustomResolution:0 :0 :0 for:self.app.host.uuid];
@@ -2989,6 +3018,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)selectCustomResolutionFromMenu:(id)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"自定义分辨率与帧率";
     alert.informativeText = @"请输入期望的分辨率（宽 x 高）和帧率（FPS）。\n设置为 0 代表由服务端决定（不建议）。";
@@ -3063,6 +3096,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)selectMatchDisplayFromMenu:(id)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     NSDictionary *prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
     BOOL currentMatch = prefs ? [prefs[@"matchDisplayResolution"] boolValue] : NO;
     if (currentMatch) {
@@ -3081,6 +3118,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)selectResolutionFromMenu:(NSMenuItem *)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     NSValue *val = sender.representedObject;
     if (!val) return;
     NSSize size = val.sizeValue;
@@ -3096,6 +3137,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)selectFrameRateFromMenu:(NSMenuItem *)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     NSNumber *fpsStats = sender.representedObject;
     if (!fpsStats) return;
     int newFps = fpsStats.intValue;
@@ -3119,6 +3164,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)selectCustomFpsFromMenu:(id)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     NSAlert *alert = [[NSAlert alloc] init];
     alert.messageText = @"自定义帧率";
     alert.informativeText = @"请输入期望的帧率（FPS）。";
@@ -3167,6 +3216,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 
 
 - (void)selectBitrateFromMenu:(NSMenuItem *)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     id rep = sender.representedObject;
     NSDictionary *prefs = [SettingsClass getSettingsFor:self.app.host.uuid];
     BOOL currentAuto = prefs ? [prefs[@"autoAdjustBitrate"] boolValue] : YES;
@@ -3192,6 +3245,10 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)handleVolumeSliderChanged:(NSSlider *)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     [SettingsClass setVolumeLevel:(CGFloat)sender.doubleValue for:self.app.host.uuid];
 }
 
@@ -3219,6 +3276,10 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 }
 
 - (void)handleBitrateSliderChanged:(NSSlider *)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     NSArray *steps = bitrateStepsArray();
     NSInteger index = (NSInteger)round(sender.doubleValue);
     index = MAX(0, MIN(index, (NSInteger)steps.count - 1));
@@ -3253,6 +3314,10 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 }
 
 - (void)handleBitrateInputChanged:(NSTextField *)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     CGFloat mbps = sender.doubleValue;
     if (mbps < 0.5) mbps = 0.5;
     if (mbps > 150) mbps = 150;
@@ -3275,6 +3340,10 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 }
 
 - (void)handleBitrateApplyClicked:(NSButton *)sender {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     // 触发重连以应用新码率
     [self rebuildStreamMenu];
     [self attemptReconnectWithReason:@"bitrate-changed"];
@@ -3295,6 +3364,10 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 }
 
 - (void)toggleMouseMode {
+    if (![SettingsClass isSettingsEditableFor:self.app.host.uuid]) {
+        return;
+    }
+
     NSString *currentMode = [SettingsClass mouseModeFor:self.app.host.uuid];
     NSString *newMode = [currentMode isEqualToString:@"game"] ? @"remote" : @"game";
 

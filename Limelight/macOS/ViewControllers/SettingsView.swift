@@ -188,10 +188,143 @@ struct SettingPaneLoader<Content: View>: View {
   }
 
   var body: some View {
-    content
-      .onAppear {
-        settingsModel.loadSettings()
+    VStack(spacing: 0) {
+      SettingsProfileScopeHeader()
+        .environmentObject(settingsModel)
+      content
+    }
+    .onAppear {
+      settingsModel.loadSettings()
+    }
+  }
+}
+
+private struct SettingsProfileScopeHeader: View {
+  @EnvironmentObject private var settingsModel: SettingsModel
+  @ObservedObject var languageManager = LanguageManager.shared
+  @SwiftUI.State private var showResetIndependentConfirm = false
+
+  private var scopeBinding: Binding<SettingsProfileSource> {
+    Binding(
+      get: { settingsModel.selectedProfileSource },
+      set: { newValue in
+        guard newValue != settingsModel.selectedProfileSource else { return }
+        switch newValue {
+        case .global:
+          settingsModel.switchToGlobal()
+        case .independent:
+          settingsModel.switchToIndependent()
+        }
       }
+    )
+  }
+
+  private var profileStatusText: String {
+    settingsModel.selectedProfileSource == .global
+      ? languageManager.localize("Following global settings. Controls below are read-only.")
+      : languageManager.localize("Using independent settings for this host.")
+  }
+
+  private var snapshotStatusText: String {
+    settingsModel.hasStoredIndependentSnapshot
+      ? languageManager.localize("Independent snapshot saved.")
+      : languageManager.localize("Independent snapshot not created yet.")
+  }
+
+  var body: some View {
+    FormSection(title: "Settings Profile") {
+      if let hosts = SettingsModel.hosts {
+        if !settingsModel.isProfileLocked {
+          FormCell(title: "Profile:", contentWidth: 180) {
+            Picker("", selection: $settingsModel.selectedHost) {
+              ForEach(hosts, id: \.self) { host in
+                if let host {
+                  let name =
+                    host.id == SettingsModel.globalHostId
+                    ? languageManager.localize("Global (Default)") : host.name
+                  Text(name).tag(Optional(host))
+                }
+              }
+            }
+            .labelsHidden()
+            .frame(maxWidth: .infinity, alignment: .trailing)
+          }
+        } else {
+          HStack {
+            Text(languageManager.localize("Profile:"))
+            Spacer()
+            let name =
+              settingsModel.selectedHost?.id == SettingsModel.globalHostId
+              ? languageManager.localize("Global (Default)")
+              : (settingsModel.selectedHost?.name ?? "")
+            Text(name)
+              .foregroundColor(.secondary)
+          }
+        }
+
+        if settingsModel.isNonGlobalHostSelected {
+          Divider()
+
+          FormCell(title: "Settings Scope", contentWidth: 260) {
+            Picker("", selection: scopeBinding) {
+              Text(languageManager.localize("Use Global Settings"))
+                .tag(SettingsProfileSource.global)
+              Text(languageManager.localize("Use Independent Settings"))
+                .tag(SettingsProfileSource.independent)
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+          }
+
+          Divider()
+
+          VStack(alignment: .leading, spacing: 4) {
+            Text(profileStatusText)
+            Text(snapshotStatusText)
+              .foregroundStyle(.secondary)
+          }
+          .font(.footnote)
+          .frame(maxWidth: .infinity, alignment: .leading)
+
+          Divider()
+
+          FormCell(title: "Independent Snapshot", contentWidth: 0) {
+            HStack(spacing: 8) {
+              Button(languageManager.localize("Clone From Global")) {
+                settingsModel.cloneGlobalToIndependentSnapshot()
+              }
+
+              Button(role: .destructive) {
+                showResetIndependentConfirm = true
+              } label: {
+                Text(languageManager.localize("Reset Independent Settings"))
+              }
+            }
+            .frame(maxWidth: .infinity, alignment: .trailing)
+          }
+        } else {
+          Divider()
+
+          HStack {
+            Spacer()
+            Text(languageManager.localize("Scope: Global"))
+              .font(.footnote)
+              .foregroundColor(.secondary)
+          }
+        }
+      }
+    }
+    .padding([.top, .horizontal])
+    .alert(
+      languageManager.localize("Dangerous Operation"), isPresented: $showResetIndependentConfirm
+    ) {
+      Button(languageManager.localize("Cancel"), role: .cancel) {}
+      Button(languageManager.localize("I Understand, Continue"), role: .destructive) {
+        settingsModel.resetIndependentSnapshotToDefaults()
+      }
+    } message: {
+      Text(languageManager.localize("Reset Independent Settings Confirm Message"))
+    }
   }
 }
 
@@ -263,51 +396,6 @@ struct StreamView: View {
     ScrollView {
       VStack {
         FormSection(title: "General") {
-          if let hosts = SettingsModel.hosts {
-            if !settingsModel.isProfileLocked {
-              FormCell(title: "Profile:", contentWidth: 150) {
-                Picker("", selection: $settingsModel.selectedHost) {
-                  ForEach(hosts, id: \.self) { host in
-                    if let host {
-                      let name =
-                        host.id == SettingsModel.globalHostId
-                        ? languageManager.localize("Global (Default)") : host.name
-                      Text(name).tag(Optional(host))
-                    }
-                  }
-                }
-                .labelsHidden()
-                .frame(maxWidth: .infinity, alignment: .trailing)
-              }
-            } else {
-              HStack {
-                Text(languageManager.localize("Profile:"))
-                Spacer()
-                let name =
-                  settingsModel.selectedHost?.id == SettingsModel.globalHostId
-                  ? languageManager.localize("Global (Default)")
-                  : (settingsModel.selectedHost?.name ?? "")
-                Text(name)
-                  .foregroundColor(.secondary)
-              }
-            }
-
-            HStack {
-              Spacer()
-              Text(
-                settingsModel.selectedHost?.id == SettingsModel.globalHostId
-                  ? languageManager.localize("Scope: Global")
-                  : String(
-                    format: languageManager.localize("Scope: Profile (%@)"),
-                    settingsModel.selectedHost?.name ?? "")
-              )
-              .font(.footnote)
-              .foregroundColor(.secondary)
-            }
-
-            Divider()
-          }
-
           FormCell(title: "Connection Method", contentWidth: 250) {
             HStack {
               Picker("", selection: $settingsModel.selectedConnectionMethod) {
@@ -323,6 +411,7 @@ struct StreamView: View {
                 }
               }
               .labelsHidden()
+              .disabled(!settingsModel.isSelectedProfileEditable)
 
               Button(action: {
                 guard let uuid = settingsModel.selectedHost?.id,
@@ -369,6 +458,7 @@ struct StreamView: View {
               .labelsHidden()
               .frame(maxWidth: .infinity, alignment: .trailing)
             })
+          .disabled(!settingsModel.isSelectedProfileEditable)
 
           Divider()
 
@@ -389,10 +479,12 @@ struct StreamView: View {
           Divider()
 
           ToggleCell(title: "Ignore Aspect Ratio", boolBinding: $settingsModel.ignoreAspectRatio)
+            .disabled(!settingsModel.isSelectedProfileEditable)
 
           Divider()
 
           ToggleCell(title: "Show Local Cursor", boolBinding: $settingsModel.showLocalCursor)
+            .disabled(!settingsModel.isSelectedProfileEditable)
         }
 
         Spacer()
@@ -546,6 +638,7 @@ struct StreamView: View {
             }
           }
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
 
         Spacer()
           .frame(height: 32)
@@ -623,6 +716,7 @@ struct StreamView: View {
             }
           }
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
 
         Spacer()
           .frame(height: 32)
@@ -697,6 +791,7 @@ struct StreamView: View {
             }
           }
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
 
         Spacer()
           .frame(height: 32)
@@ -825,6 +920,7 @@ struct VideoView: View {
             title: "Show Connection Warnings",
             boolBinding: $settingsModel.showConnectionWarnings)
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
 
         Spacer()
           .frame(height: 32)
@@ -884,6 +980,7 @@ struct AudioView: View {
             }
           }
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
 
         Spacer().frame(height: 16)
 
@@ -893,6 +990,7 @@ struct AudioView: View {
             hintKey: "Microphone hint",
             boolBinding: $settingsModel.enableMicrophone
           )
+          .disabled(!settingsModel.isSelectedProfileEditable)
           .onChange(of: settingsModel.enableMicrophone) { newValue in
             guard newValue else { return }
             micManager.refreshPermissionStatus()
@@ -1079,6 +1177,7 @@ struct InputView: View {
               .frame(maxWidth: .infinity, alignment: .trailing)
             })
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
 
         Spacer()
           .frame(height: 32)
@@ -1087,6 +1186,7 @@ struct InputView: View {
           ToggleCell(
             title: "Capture system keyboard shortcuts",
             boolBinding: $settingsModel.captureSystemShortcuts)
+          .disabled(!settingsModel.isSelectedProfileEditable)
 
           Divider()
 
@@ -1128,6 +1228,7 @@ struct InputView: View {
             title: "Gamepad Mouse Emulation", hintKey: "Gamepad Mouse Hint",
             boolBinding: $settingsModel.gamepadMouseMode)
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
 
         Spacer()
           .frame(height: 32)
@@ -1163,6 +1264,7 @@ struct InputView: View {
                     .frame(maxWidth: .infinity, alignment: .trailing)
                   })
               }
+              .disabled(!settingsModel.isSelectedProfileEditable)
             },
             label: {
               Text(languageManager.localize("Drivers"))
@@ -1329,6 +1431,7 @@ struct AppView: View {
             title: "Quit App After Stream",
             boolBinding: $settingsModel.quitAppAfterStream)
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
 
         Spacer()
           .frame(height: 32)
@@ -1348,6 +1451,7 @@ struct AppView: View {
                 placeholderDimensions: CGSize(width: 300, height: 400))
             })
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
 
         Spacer()
           .frame(height: 32)
@@ -2072,6 +2176,7 @@ struct LegacyView: View {
         FormSection(title: "Geforce Experience") {
           ToggleCell(title: "Optimize Game Settings", boolBinding: $settingsModel.optimize)
         }
+        .disabled(!settingsModel.isSelectedProfileEditable)
       }
       .padding()
     }
