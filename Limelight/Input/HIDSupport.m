@@ -897,6 +897,8 @@ static CVReturn displayLinkOutputCallback(CVDisplayLinkRef displayLink,
     if (self.useGCMouse) {
         return;
     }
+
+    static float remainX=0,remainY=0;
     
     if (self.shouldSendInputEvents) {
         PML_INPUT_STREAM_CONTEXT inputCtx = HIDInputContext(self);
@@ -913,7 +915,15 @@ static CVReturn displayLinkOutputCallback(CVDisplayLinkRef displayLink,
             LiSendMousePositionEventCtx(inputCtx, (short)loc.x, (short)(size.height - loc.y), (short)size.width, (short)size.height);
         } else {
             if (event.deltaX != 0 || event.deltaY != 0) {
-                LiSendMouseMoveEventCtx(inputCtx, event.deltaX, event.deltaY);
+                short deltaX = (short)event.deltaX;
+                short deltaY = (short)event.deltaY;
+                remainX += event.deltaX - deltaX;
+                remainY += event.deltaY - deltaY;
+                deltaX += (short)remainX;
+                deltaY += (short)remainY;
+                remainX -= (short)remainX;
+                remainY -= (short)remainY;
+                LiSendMouseMoveEventCtx(inputCtx, deltaX, deltaY);
             }
         }
     }

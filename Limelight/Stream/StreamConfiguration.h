@@ -8,6 +8,11 @@
 
 #import <Foundation/Foundation.h>
 
+typedef NS_ENUM(NSInteger, MLFramePacingMode) {
+    MLFramePacingModeLowestLatency = 0,
+    MLFramePacingModeSmoothestVideo = 1,
+};
+
 @interface StreamConfiguration : NSObject
 
 @property(nonatomic, copy) NSString *host;
@@ -30,6 +35,7 @@
 @property(nonatomic) BOOL enableHdr;
 @property(nonatomic) BOOL enableVsync;
 @property(nonatomic) BOOL showPerformanceOverlay;
+@property(nonatomic) NSInteger framePacing;
 @property(nonatomic) BOOL multiController;
 @property(nonatomic) BOOL allowHevc;
 @property(nonatomic, copy) NSData *serverCert;

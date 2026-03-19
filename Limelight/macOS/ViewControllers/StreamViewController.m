@@ -4218,6 +4218,7 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     }
     streamConfig.audioConfiguration = audioConfig;
     
+    streamConfig.framePacing = [SettingsClass framePacingFor:self.app.host.uuid];
     streamConfig.enableVsync = [SettingsClass enableVsyncFor:self.app.host.uuid];
     streamConfig.showPerformanceOverlay = [SettingsClass showPerformanceOverlayFor:self.app.host.uuid];
     streamConfig.gamepadMouseMode = [SettingsClass gamepadMouseModeFor:self.app.host.uuid];

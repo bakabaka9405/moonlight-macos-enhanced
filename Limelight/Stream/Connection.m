@@ -74,6 +74,7 @@
     float _audioVolumeMultiplier;
     NSString *_hostAddress;
     int _currentUpscalingMode;
+    MLFramePacingMode _currentFramePacingMode;
 
     AudioQueueRef _audioQueue;
     AudioQueueBufferRef _audioBuffers[AUDIO_QUEUE_BUFFERS];
@@ -177,7 +178,10 @@ int DrDecoderSetup(int videoFormat, int width, int height, int redrawRate, void*
     if (conn == nil) {
         return -1;
     }
-    [conn->_renderer setupWithVideoFormat:videoFormat frameRate:redrawRate upscalingMode:conn->_currentUpscalingMode];
+    [conn->_renderer setupWithVideoFormat:videoFormat
+                                frameRate:redrawRate
+                             framePacing:conn->_currentFramePacingMode
+                            upscalingMode:conn->_currentUpscalingMode];
     return 0;
 }
 
@@ -599,6 +603,10 @@ void ClConnectionStatusUpdate(int status)
     _renderer = myRenderer;
     _callbacks = callbacks;
     _currentUpscalingMode = config.upscalingMode;
+    _currentFramePacingMode =
+        config.framePacing == MLFramePacingModeLowestLatency
+            ? MLFramePacingModeLowestLatency
+            : MLFramePacingModeSmoothestVideo;
 
     memset(&_connectionContext, 0, sizeof(_connectionContext));
 

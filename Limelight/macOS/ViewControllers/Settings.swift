@@ -596,8 +596,7 @@ class SettingsClass: NSObject {
       let dataBitrate = settings.bitrate
       let dataCodec = SettingsModel.getBool(from: settings.codec, in: SettingsModel.videoCodecs)
 
-      // TODO: Add this back when VideoDecoderRenderer gets merged, with frame pacing setting check
-      //            let dataFramePacing = SettingsModel.getBool(from: settings.framePacing, in: SettingsModel.pacingOptions)
+      // Frame pacing is read directly from SettingsClass during stream setup.
 
       dataMan.saveSettings(
         withBitrate: dataBitrate,
@@ -766,6 +765,14 @@ class SettingsClass: NSObject {
       return settings.enableVsync ?? SettingsModel.defaultEnableVsync
     }
     return SettingsModel.defaultEnableVsync
+  }
+
+  @objc static func framePacing(for key: String) -> Int {
+    if let settings = Settings.getSettings(for: key) {
+      return settings.framePacing
+    }
+    return SettingsModel.getInt(
+      from: SettingsModel.defaultPacingOptions, in: SettingsModel.pacingOptions)
   }
 
   @objc static func showPerformanceOverlay(for key: String) -> Bool {

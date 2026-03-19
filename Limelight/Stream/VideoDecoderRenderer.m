@@ -29,6 +29,7 @@
 
 @interface VideoDecoderRenderer () <MTKViewDelegate>
 @property (nonatomic) int frameRate;
+@property (nonatomic) MLFramePacingMode framePacingMode;
 
 @end
 
@@ -206,10 +207,17 @@ static CGDirectDisplayID getDisplayID(NSScreen* screen)
     return self;
 }
 
-- (void)setupWithVideoFormat:(int)videoFormat frameRate:(int)frameRate upscalingMode:(int)upscalingMode
+- (void)setupWithVideoFormat:(int)videoFormat
+                   frameRate:(int)frameRate
+                framePacing:(MLFramePacingMode)framePacing
+               upscalingMode:(int)upscalingMode
 {
     self->videoFormat = videoFormat;
     self.frameRate = frameRate;
+    self.framePacingMode =
+        framePacing == MLFramePacingModeLowestLatency
+            ? MLFramePacingModeLowestLatency
+            : MLFramePacingModeSmoothestVideo;
 
     // MetalFX is macOS 13+. If user selected it on a newer OS but runs on an older
     // deployment target at runtime, force fallback to legacy rendering.
@@ -673,7 +681,8 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         // Only pace frames if the display refresh rate is >= 90% of our stream frame rate.
         // Battery saver, accessibility settings, or device thermals can cause the actual
         // refresh rate of the display to drop below the physical maximum.
-        if (displayRefreshRate >= self.frameRate * 0.9f) {
+        if (self.framePacingMode == MLFramePacingModeSmoothestVideo &&
+            displayRefreshRate >= self.frameRate * 0.9f) {
             // Keep one pending frame to smooth out gaps due to
             // network jitter at the cost of 1 frame of latency
             if (LiGetPendingVideoFramesCtx(depacketizerCtx) == 1) {

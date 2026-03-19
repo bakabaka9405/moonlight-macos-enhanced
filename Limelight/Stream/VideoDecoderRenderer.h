@@ -57,6 +57,7 @@ typedef struct {
 
 - (void)setupWithVideoFormat:(int)videoFormat
                    frameRate:(int)frameRate
+                framePacing:(MLFramePacingMode)framePacing
                upscalingMode:(int)upscalingMode;
 - (void)start;
 - (void)stop;
