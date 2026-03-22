@@ -128,7 +128,13 @@ def load_highlights(version: str, previous_tag: str | None) -> str:
     notes_path = NOTES_DIR / f"{version}.md"
     if notes_path.exists():
         return notes_path.read_text(encoding="utf-8").strip()
-    return build_fallback_highlights(version, previous_tag)
+
+    template_path = NOTES_DIR / "TEMPLATE.md"
+    template_hint = f" You can start from {template_path.relative_to(REPO_ROOT)}." if template_path.exists() else ""
+    raise SystemExit(
+        f"Missing curated release notes: {notes_path.relative_to(REPO_ROOT)}."
+        f"{template_hint} Automatic commit-subject fallbacks are disabled to keep release notes user-friendly."
+    )
 
 
 def build_body(version: str) -> str:
