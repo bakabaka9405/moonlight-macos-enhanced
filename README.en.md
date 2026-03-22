@@ -1,12 +1,14 @@
-# Moonlight for macOS Enhanced
+# Moonlight macOS Enhanced
 
 <div align="center">
 
 [![Build](https://github.com/skyhua0224/moonlight-macos-enhanced/actions/workflows/build.yml/badge.svg)](https://github.com/skyhua0224/moonlight-macos-enhanced/actions/workflows/build.yml) [![Release](https://img.shields.io/github/v/release/skyhua0224/moonlight-macos-enhanced?include_prereleases)](https://github.com/skyhua0224/moonlight-macos-enhanced/releases) [![Downloads](https://img.shields.io/github/downloads/skyhua0224/moonlight-macos-enhanced/total)](https://github.com/skyhua0224/moonlight-macos-enhanced/releases) [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-Native-orange.svg)]() [![License](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE.txt)
 
-**Enhanced Native Moonlight for macOS Client**
+**Native Moonlight macOS / Moonlight for macOS Client**
 
-An enhanced native Moonlight for macOS client built with AppKit/SwiftUI. It combines the smooth feel of a real Mac app with community-driven improvements for Sunshine and Foundation Sunshine users.
+`Moonlight macOS Enhanced` is a native Moonlight for macOS client for Sunshine and Foundation Sunshine, built with AppKit/SwiftUI and optimized for both Apple Silicon and Intel Macs.
+
+This repository is the main GitHub home for releases, source code, installation guidance, and release notes.
 
 [简体中文](README.md) | English
 

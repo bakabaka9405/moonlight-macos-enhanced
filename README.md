@@ -1,12 +1,14 @@
-# Moonlight for macOS Enhanced
+# Moonlight macOS Enhanced
 
 <div align="center">
 
 [![Build](https://github.com/skyhua0224/moonlight-macos-enhanced/actions/workflows/build.yml/badge.svg)](https://github.com/skyhua0224/moonlight-macos-enhanced/actions/workflows/build.yml) [![Release](https://img.shields.io/github/v/release/skyhua0224/moonlight-macos-enhanced?include_prereleases)](https://github.com/skyhua0224/moonlight-macos-enhanced/releases) [![Downloads](https://img.shields.io/github/downloads/skyhua0224/moonlight-macos-enhanced/total)](https://github.com/skyhua0224/moonlight-macos-enhanced/releases) [![Apple Silicon](https://img.shields.io/badge/Apple%20Silicon-Native-orange.svg)]() [![License](https://img.shields.io/badge/license-GPLv3-blue.svg)](LICENSE.txt)
 
-**Moonlight for macOS 原生增强版客户端**
+**Moonlight macOS / Moonlight for macOS 原生增强版客户端**
 
-一款面向 macOS 的 Moonlight 原生增强版客户端，使用 AppKit/SwiftUI 构建。结合原生 Mac 应用的流畅体验与社区增强功能，针对 Sunshine / Foundation Sunshine 做了更多优化。
+`Moonlight macOS Enhanced` 是一个面向 Sunshine 与 Foundation Sunshine 的原生 macOS 串流客户端（Moonlight for macOS client），使用 AppKit/SwiftUI 构建，并针对 Apple Silicon 与 Intel Mac 做了优化。
+
+这是本项目的主 GitHub 仓库，集中提供源码、Release、安装说明与更新日志。
 
 简体中文 | [English](README.en.md)
 
