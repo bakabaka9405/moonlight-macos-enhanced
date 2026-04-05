@@ -483,13 +483,6 @@ final class AwdlHelperManager: NSObject, ObservableObject {
             return (.unavailable, "")
         }
 
-        if !isSandboxedBuild {
-            if let error = ensurePrivilegedAuthorization() {
-                return (.failed, error)
-            }
-            return (.ready, "")
-        }
-
         let originalUp = state.up
         if let error = runPrivilegedIfconfigArgument("down") {
             return (.failed, error)
@@ -562,19 +555,6 @@ final class AwdlHelperManager: NSObject, ObservableObject {
         return "Moonlight needs administrator permission to manage the AWDL interface while streaming."
     }
 
-    private func ensurePrivilegedAuthorization() -> String? {
-        let prompt = awdlAuthorizationPrompt()
-        var errorMessage: NSString?
-        let granted = MLAwdlAuthorizationHelper.prepareSession(
-            withPrompt: prompt,
-            errorMessage: &errorMessage
-        )
-        guard granted else {
-            return normalizedAuthorizationError((errorMessage as String?) ?? "Authorization failed.")
-        }
-        return nil
-    }
-
     private func waitForInterfaceState(up expectedUp: Bool, attempts: Int = 20) -> Bool {
         for attempt in 0..<attempts {
             let state = queryAwdlInterfaceState()
@@ -591,10 +571,7 @@ final class AwdlHelperManager: NSObject, ObservableObject {
         return false
     }
 
-    private func runPrivilegedIfconfigViaInstalledHelper(_ argument: String) -> String? {
-        if let error = ensurePrivilegedAuthorization() {
-            return error
-        }
+    private func runPrivilegedIfconfigViaAuthorizationHelper(_ argument: String) -> String? {
         let prompt = awdlAuthorizationPrompt()
         var errorMessage: NSString?
         let succeeded = MLAwdlAuthorizationHelper.runIfconfigArgument(
@@ -614,6 +591,55 @@ final class AwdlHelperManager: NSObject, ObservableObject {
         }
 
         return nil
+    }
+
+    private func runPrivilegedIfconfigViaAppleScript(_ argument: String) -> String? {
+        let command = "/sbin/ifconfig awdl0 \(argument)"
+        let appleScript = "do shell script \"\(Self.escapeForAppleScript(command))\" with administrator privileges"
+
+        let executeAppleScript: () -> String? = {
+            NSApp.activate(ignoringOtherApps: true)
+            var error: NSDictionary?
+            let script = NSAppleScript(source: appleScript)
+            _ = script?.executeAndReturnError(&error)
+            guard let error else { return nil }
+
+            if let message = error[NSAppleScript.errorMessage] as? String, !message.isEmpty {
+                return message
+            }
+            return error.description
+        }
+
+        let mainThreadError: String?
+        if Thread.isMainThread {
+            mainThreadError = executeAppleScript()
+        } else {
+            var result: String?
+            DispatchQueue.main.sync {
+                result = executeAppleScript()
+            }
+            mainThreadError = result
+        }
+
+        if let mainThreadError {
+            logWarning("[diag] AWDL helper NSAppleScript request failed: \(mainThreadError)")
+        } else {
+            logInfo("[diag] AWDL helper NSAppleScript request succeeded")
+            return nil
+        }
+
+        let osascriptResult = runTask(launchPath: "/usr/bin/osascript", arguments: ["-e", appleScript])
+        if osascriptResult.terminationStatus == 0 {
+            logInfo("[diag] AWDL helper osascript fallback succeeded")
+            return nil
+        }
+
+        let taskError = !osascriptResult.stderr.isEmpty ? osascriptResult.stderr : osascriptResult.stdout
+        if !taskError.isEmpty {
+            logWarning("[diag] AWDL helper osascript fallback failed: \(taskError)")
+        }
+
+        return normalizedAuthorizationError(!taskError.isEmpty ? taskError : (mainThreadError ?? ""))
     }
 
     private func runTask(launchPath: String, arguments: [String]) -> (terminationStatus: Int32, stdout: String, stderr: String) {
@@ -665,59 +691,23 @@ final class AwdlHelperManager: NSObject, ObservableObject {
         logInfo("[diag] AWDL helper requesting privileged command: \(command)")
 
         if !isSandboxedBuild {
-            if let helperError = runPrivilegedIfconfigViaInstalledHelper(argument) {
+            let hasBundledHelper = MLAwdlAuthorizationHelper.bundledPrivilegedHelperAvailable()
+            if let helperError = runPrivilegedIfconfigViaAuthorizationHelper(argument) {
                 logWarning("[diag] AWDL privileged helper request failed: \(helperError)")
+                if hasBundledHelper {
+                    logInfo("[diag] AWDL helper falling back to administrator command prompt")
+                    if let fallbackError = runPrivilegedIfconfigViaAppleScript(argument) {
+                        return fallbackError
+                    }
+                    return nil
+                }
                 return helperError
             }
             logInfo("[diag] AWDL privileged helper request succeeded")
             return nil
         }
 
-        let appleScript = "do shell script \"\(Self.escapeForAppleScript(command))\" with administrator privileges"
-
-        let executeAppleScript: () -> String? = {
-            NSApp.activate(ignoringOtherApps: true)
-            var error: NSDictionary?
-            let script = NSAppleScript(source: appleScript)
-            _ = script?.executeAndReturnError(&error)
-            guard let error else { return nil }
-
-            if let message = error[NSAppleScript.errorMessage] as? String, !message.isEmpty {
-                return message
-            }
-            return error.description
-        }
-
-        let mainThreadError: String?
-        if Thread.isMainThread {
-            mainThreadError = executeAppleScript()
-        } else {
-            var result: String?
-            DispatchQueue.main.sync {
-                result = executeAppleScript()
-            }
-            mainThreadError = result
-        }
-
-        if let mainThreadError {
-            logWarning("[diag] AWDL helper NSAppleScript request failed: \(mainThreadError)")
-        } else {
-            logInfo("[diag] AWDL helper NSAppleScript request succeeded")
-            return nil
-        }
-
-        let osascriptResult = runTask(launchPath: "/usr/bin/osascript", arguments: ["-e", appleScript])
-        if osascriptResult.terminationStatus == 0 {
-            logInfo("[diag] AWDL helper osascript fallback succeeded")
-            return nil
-        }
-
-        let taskError = !osascriptResult.stderr.isEmpty ? osascriptResult.stderr : osascriptResult.stdout
-        if !taskError.isEmpty {
-            logWarning("[diag] AWDL helper osascript fallback failed: \(taskError)")
-        }
-
-        return normalizedAuthorizationError(!taskError.isEmpty ? taskError : (mainThreadError ?? ""))
+        return runPrivilegedIfconfigViaAppleScript(argument)
     }
 
     private static func escapeForAppleScript(_ command: String) -> String {

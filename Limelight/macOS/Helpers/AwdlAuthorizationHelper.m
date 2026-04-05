@@ -14,6 +14,7 @@ static BOOL MLAwdlAuthorizationPrepared = NO;
 static NSXPCConnection *MLAwdlPrivilegedHelperConnection = nil;
 static NSString * const MLAwdlPrivilegedHelperSuffix = @".AwdlPrivilegedHelper";
 static NSTimeInterval const MLAwdlPrivilegedHelperTimeout = 5.0;
+static NSString * const MLAwdlIfconfigToolPath = @"/sbin/ifconfig";
 
 + (NSString *)helperLabel {
     NSString *bundleIdentifier = [[NSBundle mainBundle] bundleIdentifier];
@@ -21,6 +22,25 @@ static NSTimeInterval const MLAwdlPrivilegedHelperTimeout = 5.0;
         return [@"std.skyhua.MoonlightMac" stringByAppendingString:MLAwdlPrivilegedHelperSuffix];
     }
     return [bundleIdentifier stringByAppendingString:MLAwdlPrivilegedHelperSuffix];
+}
+
++ (NSString *)bundledHelperPath {
+    NSString *bundlePath = [[NSBundle mainBundle] bundlePath];
+    if (bundlePath.length == 0) {
+        return @"";
+    }
+
+    return [bundlePath stringByAppendingPathComponent:[NSString stringWithFormat:@"Contents/Library/LaunchServices/%@", [self helperLabel]]];
+}
+
++ (BOOL)bundledPrivilegedHelperAvailable {
+    NSString *helperPath = [self bundledHelperPath];
+    if (helperPath.length == 0) {
+        return NO;
+    }
+
+    BOOL isDirectory = NO;
+    return [[NSFileManager defaultManager] fileExistsAtPath:helperPath isDirectory:&isDirectory] && !isDirectory;
 }
 
 + (NSString *)messageForStatus:(OSStatus)status fallback:(NSString *)fallback {
@@ -47,6 +67,110 @@ static NSTimeInterval const MLAwdlPrivilegedHelperTimeout = 5.0;
     }
     MLAwdlAuthorizationRef = NULL;
     return NO;
+}
+
++ (BOOL)prepareExecutionAuthorizationWithPrompt:(NSString *)prompt
+                                   errorMessage:(NSString * _Nullable * _Nullable)errorMessage {
+    if (![self ensureAuthorizationRef:errorMessage]) {
+        return NO;
+    }
+
+    if (MLAwdlAuthorizationPrepared) {
+        return YES;
+    }
+
+    const char *toolPath = MLAwdlIfconfigToolPath.UTF8String ?: "/sbin/ifconfig";
+    AuthorizationItem executeRight = {
+        .name = kAuthorizationRightExecute,
+        .valueLength = (UInt32)strlen(toolPath),
+        .value = (void *)toolPath,
+        .flags = 0,
+    };
+    AuthorizationRights rights = {
+        .count = 1,
+        .items = &executeRight,
+    };
+
+    const char *promptCString = prompt.UTF8String ?: "";
+    AuthorizationItem envItems[] = {
+        {
+            .name = kAuthorizationEnvironmentPrompt,
+            .valueLength = (UInt32)strlen(promptCString),
+            .value = (void *)promptCString,
+            .flags = 0,
+        },
+        {
+            .name = kAuthorizationEnvironmentShared,
+            .valueLength = 0,
+            .value = NULL,
+            .flags = 0,
+        },
+    };
+    AuthorizationEnvironment environment = {
+        .count = sizeof(envItems) / sizeof(envItems[0]),
+        .items = envItems,
+    };
+
+    AuthorizationFlags flags = kAuthorizationFlagExtendRights | kAuthorizationFlagInteractionAllowed | kAuthorizationFlagPreAuthorize;
+    OSStatus status = AuthorizationCopyRights(MLAwdlAuthorizationRef, &rights, &environment, flags, NULL);
+    if (status != errAuthorizationSuccess) {
+        MLAwdlAuthorizationPrepared = NO;
+        if (errorMessage != NULL) {
+            *errorMessage = [self messageForStatus:status fallback:[NSString stringWithFormat:@"Authorization failed (%d).", (int)status]];
+        }
+        return NO;
+    }
+
+    MLAwdlAuthorizationPrepared = YES;
+    return YES;
+}
+
++ (BOOL)runIfconfigArgumentViaAuthorizationExecute:(NSString *)argument
+                                      errorMessage:(NSString * _Nullable * _Nullable)errorMessage {
+    if (![self ensureAuthorizationRef:errorMessage]) {
+        return NO;
+    }
+
+    char *args[] = {
+        "awdl0",
+        (char *)argument.UTF8String,
+        NULL
+    };
+
+    FILE *pipe = NULL;
+    OSStatus status = AuthorizationExecuteWithPrivileges(
+        MLAwdlAuthorizationRef,
+        MLAwdlIfconfigToolPath.UTF8String,
+        kAuthorizationFlagDefaults,
+        args,
+        &pipe
+    );
+    if (status != errAuthorizationSuccess) {
+        if (errorMessage != NULL) {
+            *errorMessage = [self messageForStatus:status fallback:[NSString stringWithFormat:@"Authorization failed (%d).", (int)status]];
+        }
+        return NO;
+    }
+
+    NSMutableData *outputData = [NSMutableData data];
+    if (pipe != NULL) {
+        char buffer[512];
+        size_t bytesRead = 0;
+        while ((bytesRead = fread(buffer, 1, sizeof(buffer), pipe)) > 0) {
+            [outputData appendBytes:buffer length:bytesRead];
+        }
+        fclose(pipe);
+    }
+
+    if (errorMessage != NULL && outputData.length > 0) {
+        NSString *output = [[NSString alloc] initWithData:outputData encoding:NSUTF8StringEncoding];
+        NSString *trimmed = [output stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (trimmed.length > 0) {
+            *errorMessage = trimmed;
+        }
+    }
+
+    return YES;
 }
 
 + (void)invalidateConnection {
@@ -154,6 +278,10 @@ static NSTimeInterval const MLAwdlPrivilegedHelperTimeout = 5.0;
 
 + (BOOL)prepareSessionWithPrompt:(NSString *)prompt
                     errorMessage:(NSString * _Nullable * _Nullable)errorMessage {
+    if (![self bundledPrivilegedHelperAvailable]) {
+        return [self prepareExecutionAuthorizationWithPrompt:prompt errorMessage:errorMessage];
+    }
+
     NSString *connectionError = nil;
     if ([self queryHelperInstalledWithErrorMessage:&connectionError]) {
         return YES;
@@ -231,6 +359,13 @@ static NSTimeInterval const MLAwdlPrivilegedHelperTimeout = 5.0;
 + (BOOL)runIfconfigArgument:(NSString *)argument
                      prompt:(NSString *)prompt
                errorMessage:(NSString * _Nullable * _Nullable)errorMessage {
+    if (![self bundledPrivilegedHelperAvailable]) {
+        if (![self prepareExecutionAuthorizationWithPrompt:prompt errorMessage:errorMessage]) {
+            return NO;
+        }
+        return [self runIfconfigArgumentViaAuthorizationExecute:argument errorMessage:errorMessage];
+    }
+
     if (![self prepareSessionWithPrompt:prompt errorMessage:errorMessage]) {
         return NO;
     }

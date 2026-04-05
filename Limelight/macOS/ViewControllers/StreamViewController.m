@@ -730,6 +730,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
 @property (nonatomic) BOOL edgeMenuTemporaryReleaseActive;
 @property (nonatomic) BOOL edgeMenuDragging;
 @property (nonatomic) BOOL edgeMenuMenuVisible;
+@property (nonatomic) BOOL suppressNextRightMouseUp;
 
 @property (nonatomic, strong) NSMenu *streamMenu;
 
@@ -2857,19 +2858,24 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)rightMouseDown:(NSEvent *)event {
-    // When mouse isn't captured (or user holds Control), treat right-click as local control center.
-    // Otherwise forward to the remote host.
-    BOOL forceLocalMenu = (event.modifierFlags & NSEventModifierFlagControl) != 0;
-    if (!self.isMouseCaptured || forceLocalMenu) {
+    if (!self.isMouseCaptured) {
+        self.suppressNextRightMouseUp = YES;
         [self presentStreamMenuAtEvent:event];
         return;
     }
 
-    [self.hidSupport mouseDown:event withButton:BUTTON_RIGHT];
+    int button = (event.buttonNumber == 0) ? BUTTON_LEFT : BUTTON_RIGHT;
+    [self.hidSupport mouseDown:event withButton:button];
 }
 
 - (void)rightMouseUp:(NSEvent *)event {
-    [self.hidSupport mouseUp:event withButton:BUTTON_RIGHT];
+    if (self.suppressNextRightMouseUp) {
+        self.suppressNextRightMouseUp = NO;
+        return;
+    }
+
+    int button = (event.buttonNumber == 0) ? BUTTON_LEFT : BUTTON_RIGHT;
+    [self.hidSupport mouseUp:event withButton:button];
 }
 
 - (void)otherMouseDown:(NSEvent *)event {

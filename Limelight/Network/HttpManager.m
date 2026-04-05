@@ -27,7 +27,8 @@
 @implementation HttpManager {
     NSString* _baseHTTPURL;
     NSString* _baseHTTPSURL;
-    NSString* _uniqueId;
+    NSString* _clientUniqueId;
+    NSString* _sharedStreamUniqueId;
     NSString* _deviceName;
     NSData* _serverCert;
     
@@ -37,6 +38,7 @@
 static uint64_t gLastServerInfoErrorLogMs = 0;
 static int gSuppressedServerInfoErrorLogs = 0;
 static const char *kTempKeychainPassword = "limelight";
+static NSString * const kSharedStreamSessionUniqueId = @"0123456789ABCDEF";
 // Not always exposed as a named constant in older SDKs.
 static const OSStatus kErrSecPkcs12VerifyFailure = -25264;
 static SecKeychainRef gTempClientKeychain = NULL;
@@ -94,9 +96,12 @@ static const NSString* HTTPS_PORT = @"47984";
 
 - (id) initWithHost:(NSString*) host uniqueId:(NSString*) uniqueId serverCert:(NSData*) serverCert {
     self = [super init];
-    // Use the same UID for all Moonlight clients to allow them
-    // quit games started on another Moonlight client.
-    _uniqueId = @"0123456789ABCDEF";
+    // Use a per-client ID for pairing/discovery so different Moonlight installs
+    // don't overwrite each other's pairing state on the host.
+    _clientUniqueId = uniqueId.length > 0 ? uniqueId : kSharedStreamSessionUniqueId;
+    // Keep the historical shared stream session ID so another Moonlight client
+    // can still stop a session started elsewhere.
+    _sharedStreamUniqueId = kSharedStreamSessionUniqueId;
     _deviceName = deviceName;
     _serverCert = serverCert;
     
@@ -227,40 +232,40 @@ static const NSString* HTTPS_PORT = @"47984";
 
 - (NSURLRequest*) newPairRequest:(NSData*)salt clientCert:(NSData*)clientCert {
     NSString* urlString = [NSString stringWithFormat:@"%@/pair?uniqueid=%@&devicename=%@&updateState=1&phrase=getservercert&salt=%@&clientcert=%@",
-                           _baseHTTPURL, _uniqueId, _deviceName, [self bytesToHex:salt], [self bytesToHex:clientCert]];
+                           _baseHTTPURL, _clientUniqueId, _deviceName, [self bytesToHex:salt], [self bytesToHex:clientCert]];
     // This call blocks while waiting for the user to input the PIN on the PC
     return [self createRequestFromString:urlString timeout:EXTRA_LONG_TIMEOUT_SEC];
 }
 
 - (NSURLRequest*) newUnpairRequest {
-    NSString* urlString = [NSString stringWithFormat:@"%@/unpair?uniqueid=%@", _baseHTTPURL, _uniqueId];
+    NSString* urlString = [NSString stringWithFormat:@"%@/unpair?uniqueid=%@", _baseHTTPURL, _clientUniqueId];
     return [self createRequestFromString:urlString timeout:NORMAL_TIMEOUT_SEC];
 }
 
 - (NSURLRequest*) newChallengeRequest:(NSData*)challenge {
     NSString* urlString = [NSString stringWithFormat:@"%@/pair?uniqueid=%@&devicename=%@&updateState=1&clientchallenge=%@",
-                           _baseHTTPURL, _uniqueId, _deviceName, [self bytesToHex:challenge]];
+                           _baseHTTPURL, _clientUniqueId, _deviceName, [self bytesToHex:challenge]];
     return [self createRequestFromString:urlString timeout:NORMAL_TIMEOUT_SEC];
 }
 
 - (NSURLRequest*) newChallengeRespRequest:(NSData*)challengeResp {
     NSString* urlString = [NSString stringWithFormat:@"%@/pair?uniqueid=%@&devicename=%@&updateState=1&serverchallengeresp=%@",
-                           _baseHTTPURL, _uniqueId, _deviceName, [self bytesToHex:challengeResp]];
+                           _baseHTTPURL, _clientUniqueId, _deviceName, [self bytesToHex:challengeResp]];
     return [self createRequestFromString:urlString timeout:NORMAL_TIMEOUT_SEC];
 }
 
 - (NSURLRequest*) newClientSecretRespRequest:(NSString*)clientPairSecret {
-    NSString* urlString = [NSString stringWithFormat:@"%@/pair?uniqueid=%@&devicename=%@&updateState=1&clientpairingsecret=%@", _baseHTTPURL, _uniqueId, _deviceName, clientPairSecret];
+    NSString* urlString = [NSString stringWithFormat:@"%@/pair?uniqueid=%@&devicename=%@&updateState=1&clientpairingsecret=%@", _baseHTTPURL, _clientUniqueId, _deviceName, clientPairSecret];
     return [self createRequestFromString:urlString timeout:NORMAL_TIMEOUT_SEC];
 }
 
 - (NSURLRequest*) newPairChallenge {
-    NSString* urlString = [NSString stringWithFormat:@"%@/pair?uniqueid=%@&devicename=%@&updateState=1&phrase=pairchallenge", _baseHTTPSURL, _uniqueId, _deviceName];
+    NSString* urlString = [NSString stringWithFormat:@"%@/pair?uniqueid=%@&devicename=%@&updateState=1&phrase=pairchallenge", _baseHTTPSURL, _clientUniqueId, _deviceName];
     return [self createRequestFromString:urlString timeout:NORMAL_TIMEOUT_SEC];
 }
 
 - (NSURLRequest *)newAppListRequest {
-    NSString* urlString = [NSString stringWithFormat:@"%@/applist?uniqueid=%@", _baseHTTPSURL, _uniqueId];
+    NSString* urlString = [NSString stringWithFormat:@"%@/applist?uniqueid=%@", _baseHTTPSURL, _clientUniqueId];
     return [self createRequestFromString:urlString timeout:NORMAL_TIMEOUT_SEC];
 }
 
@@ -270,14 +275,14 @@ static const NSString* HTTPS_PORT = @"47984";
         return [self newHttpServerInfoRequest:fastFail];
     }
     
-    NSString* urlString = [NSString stringWithFormat:@"%@/serverinfo?uniqueid=%@", _baseHTTPSURL, _uniqueId];
+    NSString* urlString = [NSString stringWithFormat:@"%@/serverinfo?uniqueid=%@", _baseHTTPSURL, _clientUniqueId];
     return [self createRequestFromString:urlString timeout:(fastFail ? SHORT_TIMEOUT_SEC : NORMAL_TIMEOUT_SEC)];
 }
 
 - (NSURLRequest *)newHttpServerInfoRequest:(bool)fastFail {
     // Keep uniqueid on HTTP fallback too; some legacy hosts report PairStatus
     // against the supplied client ID and may otherwise default to unpaired.
-    NSString* urlString = [NSString stringWithFormat:@"%@/serverinfo?uniqueid=%@", _baseHTTPURL, _uniqueId];
+    NSString* urlString = [NSString stringWithFormat:@"%@/serverinfo?uniqueid=%@", _baseHTTPURL, _clientUniqueId];
     return [self createRequestFromString:urlString timeout:(fastFail ? SHORT_TIMEOUT_SEC : NORMAL_TIMEOUT_SEC)];
 }
 
@@ -356,7 +361,7 @@ static const NSString* HTTPS_PORT = @"47984";
     }
     
     NSString* urlString = [NSString stringWithFormat:@"%@/launch?uniqueid=%@&appid=%@&mode=%dx%dx%d&additionalStates=1&sops=%d&rikey=%@&rikeyid=%d%@%@&localAudioPlayMode=%d&surroundAudioInfo=%d",
-                           _baseHTTPSURL, _uniqueId,
+                           _baseHTTPSURL, _sharedStreamUniqueId,
                            config.appID,
                            modeWidth, modeHeight, modeFps,
                            sops ? 1 : 0,
@@ -437,7 +442,7 @@ static const NSString* HTTPS_PORT = @"47984";
     }
     
     NSString* urlString = [NSString stringWithFormat:@"%@/resume?uniqueid=%@&appid=%@&mode=%dx%dx%d&additionalStates=1&sops=%d&rikey=%@&rikeyid=%d%@%@&localAudioPlayMode=%d&surroundAudioInfo=%d",
-                           _baseHTTPSURL, _uniqueId,
+                           _baseHTTPSURL, _sharedStreamUniqueId,
                            config.appID,
                            modeWidth, modeHeight, modeFps,
                            sops ? 1 : 0,
@@ -452,12 +457,12 @@ static const NSString* HTTPS_PORT = @"47984";
 }
 
 - (NSURLRequest*) newQuitAppRequest {
-    NSString* urlString = [NSString stringWithFormat:@"%@/cancel?uniqueid=%@", _baseHTTPSURL, _uniqueId];
+    NSString* urlString = [NSString stringWithFormat:@"%@/cancel?uniqueid=%@", _baseHTTPSURL, _sharedStreamUniqueId];
     return [self createRequestFromString:urlString timeout:LONG_TIMEOUT_SEC];
 }
 
 - (NSURLRequest*) newAppAssetRequestWithAppId:(NSString *)appId {
-    NSString* urlString = [NSString stringWithFormat:@"%@/appasset?uniqueid=%@&appid=%@&AssetType=2&AssetIdx=0", _baseHTTPSURL, _uniqueId, appId];
+    NSString* urlString = [NSString stringWithFormat:@"%@/appasset?uniqueid=%@&appid=%@&AssetType=2&AssetIdx=0", _baseHTTPSURL, _clientUniqueId, appId];
     return [self createRequestFromString:urlString timeout:NORMAL_TIMEOUT_SEC];
 }
 

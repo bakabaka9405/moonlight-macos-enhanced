@@ -4,6 +4,8 @@ NS_ASSUME_NONNULL_BEGIN
 
 @interface MLAwdlAuthorizationHelper : NSObject
 
++ (BOOL)bundledPrivilegedHelperAvailable;
+
 + (BOOL)prepareSessionWithPrompt:(NSString *)prompt
                     errorMessage:(NSString * _Nullable * _Nullable)errorMessage;
 
