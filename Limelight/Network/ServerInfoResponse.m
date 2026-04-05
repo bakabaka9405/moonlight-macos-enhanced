@@ -55,6 +55,9 @@
     if (serverCodecModeString != nil) {
         host.serverCodecModeSupport = [[serverCodecModeString trim] intValue];
     }
+
+    host.appVersion = [[self getStringTag:@"appversion"] trim];
+    host.gfeVersion = [[self getStringTag:@"GfeVersion"] trim];
 }
 
 @end

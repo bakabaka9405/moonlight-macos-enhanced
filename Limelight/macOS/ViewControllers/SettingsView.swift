@@ -23,6 +23,10 @@ enum SettingsPaneType: Int, CaseIterable {
   case app = 3
   case legacy = 4
 
+  static var allCases: [SettingsPaneType] {
+    [.stream, .video, .audio, .input, .app]
+  }
+
   var title: String {
     switch self {
     case .stream:
@@ -127,6 +131,10 @@ struct SettingsView: View {
     }
     .frame(minWidth: 575, minHeight: 275)
     .onAppear {
+      if selectedPane == .legacy {
+        selectedPane = .app
+      }
+
       if let hostId {
         settingsModel.selectHost(id: hostId)
       } else {
@@ -166,9 +174,13 @@ struct Detail: View {
   @EnvironmentObject private var settingsModel: SettingsModel
   @ObservedObject var languageManager = LanguageManager.shared
 
+  private var effectivePane: SettingsPaneType {
+    pane == .legacy ? .app : pane
+  }
+
   var body: some View {
     Group {
-      switch pane {
+      switch effectivePane {
       case .stream:
         SettingPaneLoader(settingsModel) {
           StreamView()
@@ -190,13 +202,11 @@ struct Detail: View {
           AppView()
         }
       case .legacy:
-        SettingPaneLoader(settingsModel) {
-          LegacyView()
-        }
+        EmptyView()
       }
     }
     .environmentObject(settingsModel)
-    .navigationTitle(languageManager.localize(pane.title))
+    .navigationTitle(languageManager.localize(effectivePane.title))
   }
 }
 
@@ -292,28 +302,18 @@ struct StreamView: View {
     let safe = safeDisplayPixelSize()
 
     if displayMode == "Fullscreen", let safe {
-      return "\(base) (\(languageManager.localize("Fullscreen Safe Area")) \(Int(safe.width))×\(Int(safe.height)))"
+      return "\(base) (\(Int(safe.width))×\(Int(safe.height)))"
     }
 
     if let native {
-      let prefix =
-        (displayMode == "Borderless Windowed")
-        ? languageManager.localize("Full Panel")
-        : ((safe != nil && safe != native) ? languageManager.localize("Full Panel") : "")
-      if prefix.isEmpty {
-        return "\(base) (\(Int(native.width))×\(Int(native.height)))"
-      }
-      return "\(base) (\(prefix) \(Int(native.width))×\(Int(native.height)))"
+      return "\(base) (\(Int(native.width))×\(Int(native.height)))"
     }
 
     return base
   }
 
   private func displayResolutionModeHint() -> String {
-    if settingsModel.selectedDisplayMode == "Fullscreen" {
-      return languageManager.localize("Fullscreen Safe Resolution hint")
-    }
-    return languageManager.localize("Full Panel Resolution hint")
+    return languageManager.localize("Match Display Resolution hint")
   }
 
   private func statusDotImage(state: Int) -> Image {
@@ -774,10 +774,6 @@ struct StreamView: View {
           }
         }
 
-        Spacer()
-          .frame(height: 32)
-
-        StreamRiskSummarySection(assessment: settingsModel.streamRiskAssessment)
       }
       .padding()
       .onAppear {
@@ -842,6 +838,45 @@ struct StreamView: View {
 struct VideoView: View {
   @EnvironmentObject private var settingsModel: SettingsModel
   @ObservedObject var languageManager = LanguageManager.shared
+  @AppStorage("settings.video.customTimingRiskAcknowledged") private var customTimingRiskAcknowledged = false
+  @SwiftUI.State private var showCustomTimingRiskAlert = false
+
+  private var showingCustomTimingControls: Bool {
+    settingsModel.selectedSmoothnessLatencyMode == SettingsModel.smoothnessLatencyCustom
+  }
+
+  private var videoCodecDetailKey: String {
+    switch settingsModel.selectedVideoCodec {
+    case "AV1":
+      return "Video Codec AV1 detail"
+    case "H.265":
+      return "Video Codec H265 detail"
+    default:
+      return "Video Codec H264 detail"
+    }
+  }
+
+  private var videoCodecStatus: (key: String, color: Color)? {
+    guard settingsModel.selectedVideoCodec == "AV1" else { return nil }
+    if settingsModel.enableYUV444 {
+      return ("Video Codec AV1 YUV444 fallback detail", .orange)
+    }
+    if SettingsModel.av1HardwareDecodeSupported {
+      return ("Video Codec AV1 current device ready detail", .secondary)
+    }
+    return ("Video Codec AV1 current device fallback detail", .orange)
+  }
+
+  private func timingBufferDisplayKey(for level: String) -> String {
+    switch level {
+    case SettingsModel.timingBufferLow:
+      return "Buffer Level Low label"
+    case SettingsModel.timingBufferHigh:
+      return "Buffer Level High label"
+    default:
+      return "Buffer Level Standard label"
+    }
+  }
 
   var body: some View {
     ScrollView {
@@ -859,6 +894,18 @@ struct VideoView: View {
               .frame(maxWidth: .infinity, alignment: .trailing)
             })
 
+          Text(languageManager.localize(videoCodecDetailKey))
+            .font(.footnote)
+            .foregroundColor(.secondary)
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+          if let videoCodecStatus {
+            Text(languageManager.localize(videoCodecStatus.key))
+              .font(.footnote)
+              .foregroundColor(videoCodecStatus.color)
+              .frame(maxWidth: .infinity, alignment: .leading)
+          }
+
           Divider()
 
           ToggleCell(title: "HDR", boolBinding: $settingsModel.hdr)
@@ -873,21 +920,83 @@ struct VideoView: View {
 
           Divider()
 
-          ToggleCell(title: "V-Sync", boolBinding: $settingsModel.enableVsync)
-
-          Divider()
-
           FormCell(
-            title: "Frame Pacing", contentWidth: 200,
+            title: "Streaming Style", contentWidth: 200,
             content: {
-              Picker("", selection: $settingsModel.selectedPacingOptions) {
-                ForEach(SettingsModel.pacingOptions, id: \.self) { pacingOption in
-                  Text(languageManager.localize(pacingOption))
+              Picker("", selection: $settingsModel.selectedSmoothnessLatencyMode) {
+                ForEach(SettingsModel.smoothnessLatencyModes, id: \.self) { mode in
+                  Text(languageManager.localize(mode))
                 }
               }
               .labelsHidden()
               .frame(maxWidth: .infinity, alignment: .trailing)
             })
+
+          SettingDescriptionRow(textKey: "Streaming Style detail")
+
+          if showingCustomTimingControls {
+            Divider()
+
+            SettingDescriptionRow(textKey: "Custom timing hint")
+
+            Divider()
+
+            InlineSectionLabel(title: "Custom Options")
+
+            ToggleCell(
+              title: "V-Sync",
+              boolBinding: $settingsModel.enableVsync
+            )
+
+            SettingDescriptionRow(textKey: "V-Sync detail")
+
+            Divider()
+
+            FormCell(
+              title: "Buffer Level", contentWidth: 200,
+              content: {
+                Picker("", selection: $settingsModel.selectedTimingBufferLevel) {
+                  ForEach(SettingsModel.timingBufferLevels, id: \.self) { level in
+                    Text(languageManager.localize(timingBufferDisplayKey(for: level)))
+                  }
+                }
+                .labelsHidden()
+                .frame(maxWidth: .infinity, alignment: .trailing)
+              })
+
+            SettingDescriptionRow(textKey: "Buffer Level detail")
+
+            Divider()
+
+            ToggleCell(
+              title: "Prioritize Responsiveness",
+              boolBinding: $settingsModel.timingPrioritizeResponsiveness
+            )
+
+            SettingDescriptionRow(textKey: "Prioritize Responsiveness detail")
+          }
+
+          Divider()
+
+          InlineSectionLabel(title: "Compatibility")
+
+          SettingDescriptionRow(textKey: "Compatibility section detail")
+
+          ToggleCell(
+            title: "Compatibility Mode",
+            boolBinding: $settingsModel.timingCompatibilityMode
+          )
+
+          SettingDescriptionRow(textKey: "Compatibility Mode detail")
+
+          Divider()
+
+          ToggleCell(
+            title: "SDR Compatibility Workaround",
+            boolBinding: $settingsModel.timingSdrCompatibilityWorkaround
+          )
+
+          SettingDescriptionRow(textKey: "SDR Compatibility Workaround detail")
 
           Divider()
 
@@ -902,12 +1011,28 @@ struct VideoView: View {
             boolBinding: $settingsModel.showConnectionWarnings)
         }
 
-        Spacer()
-          .frame(height: 32)
-
-        StreamRiskSummarySection(assessment: settingsModel.streamRiskAssessment)
       }
       .padding()
+    }
+    .onChange(of: settingsModel.selectedSmoothnessLatencyMode) { newValue in
+      guard
+        newValue == SettingsModel.smoothnessLatencyCustom,
+        !customTimingRiskAcknowledged
+      else { return }
+      showCustomTimingRiskAlert = true
+    }
+    .alert(
+      languageManager.localize("Custom timing risk title"),
+      isPresented: $showCustomTimingRiskAlert
+    ) {
+      Button(languageManager.localize("Use Balanced Instead"), role: .cancel) {
+        settingsModel.selectedSmoothnessLatencyMode = SettingsModel.smoothnessLatencyBalanced
+      }
+      Button(languageManager.localize("Keep Custom")) {
+        customTimingRiskAcknowledged = true
+      }
+    } message: {
+      Text(languageManager.localize("Custom timing risk detail"))
     }
   }
 }
@@ -1119,7 +1244,7 @@ private struct MicLevelBar: View {
 struct InputView: View {
   @EnvironmentObject private var settingsModel: SettingsModel
   @ObservedObject var languageManager = LanguageManager.shared
-  @SwiftUI.State private var showAdvancedInput = false
+  @AppStorage("settings.input.showAdvancedInput") private var showAdvancedInput = false
 
   var body: some View {
     ScrollView {
@@ -1297,9 +1422,12 @@ private struct MoonlightDisclosureGroupStyleCompat: ViewModifier {
 struct AppView: View {
   @EnvironmentObject private var settingsModel: SettingsModel
   @ObservedObject var languageManager = LanguageManager.shared
+  @ObservedObject private var awdlManager = AwdlHelperManager.sharedManager
   @AppStorage("theme") private var appAppearanceRawValue = AppAppearanceOption.system.rawValue
   @AppStorage("autoDiscoverNewHosts") private var autoDiscoverNewHosts = true
   @SwiftUI.State private var showLiveLogViewer = false
+  @SwiftUI.State private var showAwdlHelperWarning = false
+  @SwiftUI.State private var awdlEnableAfterWarning = true
   @SwiftUI.State private var showHostResetConfirm = false
   @SwiftUI.State private var showFullResetConfirm = false
   @SwiftUI.State private var showResetDone = false
@@ -1454,6 +1582,14 @@ struct AppView: View {
     }
   }
 
+  private func requestAwdlAuthorization(enableOnSuccess: Bool) {
+    awdlManager.requestAuthorization { granted in
+      if enableOnSuccess {
+        settingsModel.awdlStabilityHelperEnabled = granted
+      }
+    }
+  }
+
   var body: some View {
     ScrollView {
       VStack {
@@ -1480,6 +1616,14 @@ struct AppView: View {
           ToggleCell(
             title: "Quit App After Stream",
             boolBinding: $settingsModel.quitAppAfterStream)
+
+          Divider()
+
+          DetailedToggleSettingRow(
+            title: "Optimize Game Settings",
+            descriptionKey: "Optimize Game Settings detail",
+            boolBinding: $settingsModel.optimize
+          )
         }
 
         Spacer()
@@ -1504,7 +1648,17 @@ struct AppView: View {
         Spacer()
           .frame(height: 32)
 
-        FormSection(title: "Misc") {
+        FormSection(title: "Advanced") {
+          AwdlNetworkCompatibilitySettingsSection(
+            awdlManager: awdlManager,
+            showWarning: $showAwdlHelperWarning,
+            enableAfterWarning: $awdlEnableAfterWarning,
+            requestAuthorization: { enableOnSuccess in
+              requestAwdlAuthorization(enableOnSuccess: enableOnSuccess)
+            })
+
+          Divider()
+
           FormCell(title: "Debug Log", contentWidth: 0) {
             HStack(spacing: 8) {
               Button(languageManager.localize("View Log")) {
@@ -1528,31 +1682,33 @@ struct AppView: View {
             }
           }
 
-          FormCell(title: "Pairing Cache", contentWidth: 0) {
-            VStack(alignment: .trailing, spacing: 14) {
-              Button(role: .destructive) {
-                showHostResetConfirm = true
-              } label: {
-                Text(languageManager.localize("Reset Hosts (Recommended)"))
-              }
-              .buttonStyle(.borderedProminent)
-              .tint(.red)
+          Divider()
 
-              Text(languageManager.localize("Advanced Reset Separator"))
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-              Button(role: .destructive) {
-                showFullResetConfirm = true
-              } label: {
-                Text(languageManager.localize("Full Reset (Pairing + Cache)"))
-              }
-              .buttonStyle(.bordered)
-              .tint(.red)
-              .padding(.top, 2)
+          FormCell(title: "Reset Hosts", contentWidth: 0) {
+            Button(role: .destructive) {
+              showHostResetConfirm = true
+            } label: {
+              Text(languageManager.localize("Reset Hosts (Recommended)"))
             }
-            .frame(maxWidth: .infinity, alignment: .trailing)
+            .buttonStyle(.borderedProminent)
+            .tint(.red)
           }
+
+          SettingDescriptionRow(textKey: "Reset Hosts detail")
+
+          Divider()
+
+          FormCell(title: "Full Reset", contentWidth: 0) {
+            Button(role: .destructive) {
+              showFullResetConfirm = true
+            } label: {
+              Text(languageManager.localize("Full Reset (Pairing + Cache)"))
+            }
+            .buttonStyle(.bordered)
+            .tint(.red)
+          }
+
+          SettingDescriptionRow(textKey: "Full Reset detail")
         }
       }
       .padding()
@@ -1560,6 +1716,15 @@ struct AppView: View {
     .sheet(isPresented: $showLiveLogViewer) {
       DebugLogLiveView(rawLogURL: rawDebugLogFileURL(), curatedLogURL: curatedDebugLogFileURL())
         .environmentObject(settingsModel)
+    }
+    .alert(languageManager.localize("AWDL Helper Warning Title"), isPresented: $showAwdlHelperWarning) {
+      Button(languageManager.localize("Cancel"), role: .cancel) {}
+      Button(languageManager.localize("Enable"), role: .destructive) {
+        settingsModel.awdlStabilityHelperAcknowledged = true
+        requestAwdlAuthorization(enableOnSuccess: awdlEnableAfterWarning)
+      }
+    } message: {
+      Text(languageManager.localize("AWDL Helper Warning Message"))
     }
     .alert(languageManager.localize("Dangerous Operation"), isPresented: $showHostResetConfirm) {
       Button(languageManager.localize("Cancel"), role: .cancel) {}
@@ -1588,6 +1753,138 @@ struct AppView: View {
       }
     } message: {
       Text(languageManager.localize(resetDoneMessageKey))
+    }
+  }
+}
+
+private struct AwdlNetworkCompatibilitySettingsSection: View {
+  @EnvironmentObject private var settingsModel: SettingsModel
+  @ObservedObject var awdlManager: AwdlHelperManager
+  @ObservedObject var languageManager = LanguageManager.shared
+  @Binding var showWarning: Bool
+  @Binding var enableAfterWarning: Bool
+  let requestAuthorization: (Bool) -> Void
+
+  private var helperBinding: Binding<Bool> {
+    Binding(
+      get: {
+        settingsModel.awdlStabilityHelperEnabled
+      },
+      set: { newValue in
+        guard newValue != settingsModel.awdlStabilityHelperEnabled else { return }
+
+        if newValue {
+          guard settingsModel.awdlStabilityHelperAcknowledged else {
+            enableAfterWarning = true
+            showWarning = true
+            return
+          }
+
+          switch awdlManager.authorizationState {
+          case .ready:
+            settingsModel.awdlStabilityHelperEnabled = true
+          case .notDetermined, .failed:
+            requestAuthorization(true)
+          case .unavailable:
+            settingsModel.awdlStabilityHelperEnabled = false
+          }
+        } else {
+          settingsModel.awdlStabilityHelperEnabled = false
+        }
+      })
+  }
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 10) {
+      ToggleCell(
+        title: "AWDL Stability Helper",
+        boolBinding: helperBinding
+      )
+
+      SettingDescriptionRow(textKey: "Stream-Only AWDL Stability Helper detail")
+
+      Divider()
+
+      AwdlPermissionRow(
+        awdlManager: awdlManager,
+        requestAuthorization: {
+          if settingsModel.awdlStabilityHelperAcknowledged {
+            requestAuthorization(false)
+          } else {
+            enableAfterWarning = false
+            showWarning = true
+          }
+        })
+
+      if awdlManager.authorizationState == .failed,
+         !awdlManager.lastErrorMessage.isEmpty
+      {
+        Text(
+          String(
+            format: languageManager.localize("AWDL Helper Last Error %@"),
+            awdlManager.lastErrorMessage
+          )
+        )
+          .font(.footnote)
+          .foregroundColor(.secondary)
+          .frame(maxWidth: .infinity, alignment: .leading)
+      }
+    }
+    .onAppear {
+      awdlManager.refreshAuthorizationStatus()
+    }
+  }
+}
+
+private struct AwdlPermissionRow: View {
+  @ObservedObject var awdlManager: AwdlHelperManager
+  let requestAuthorization: () -> Void
+  @ObservedObject var languageManager = LanguageManager.shared
+
+  var body: some View {
+    HStack {
+      Text(languageManager.localize("AWDL Helper Privilege"))
+      Spacer()
+
+      if awdlManager.isRequestingAuthorization {
+        ProgressView()
+          .controlSize(.small)
+      } else {
+        switch awdlManager.authorizationState {
+        case .ready:
+          Label(languageManager.localize("AWDL Helper Ready"), systemImage: "checkmark.circle.fill")
+            .foregroundColor(.green)
+            .font(.callout)
+        case .failed:
+          HStack(spacing: 8) {
+            Label(languageManager.localize("AWDL Helper Failed"), systemImage: "xmark.circle.fill")
+              .foregroundColor(.red)
+              .font(.callout)
+            Button(languageManager.localize("Retry")) {
+              requestAuthorization()
+            }
+            .controlSize(.small)
+          }
+        case .notDetermined:
+          HStack(spacing: 8) {
+            Text(languageManager.localize("Not Determined"))
+              .foregroundColor(.secondary)
+              .font(.callout)
+            Button(languageManager.localize("Request")) {
+              requestAuthorization()
+            }
+            .controlSize(.small)
+          }
+        case .unavailable:
+          Text(languageManager.localize("Not Available"))
+            .foregroundColor(.secondary)
+            .font(.callout)
+        @unknown default:
+          Text(languageManager.localize("Not Determined"))
+            .foregroundColor(.secondary)
+            .font(.callout)
+        }
+      }
     }
   }
 }
@@ -2215,18 +2512,8 @@ private struct DebugLogEntryDetailView: View {
 }
 
 struct LegacyView: View {
-  @EnvironmentObject private var settingsModel: SettingsModel
-  @ObservedObject var languageManager = LanguageManager.shared
-
   var body: some View {
-    ScrollView {
-      VStack {
-        FormSection(title: "Geforce Experience") {
-          ToggleCell(title: "Optimize Game Settings", boolBinding: $settingsModel.optimize)
-        }
-      }
-      .padding()
-    }
+    EmptyView()
   }
 }
 
@@ -2234,7 +2521,7 @@ struct LegacyView: View {
 struct StreamRiskSummarySection: View {
   let assessment: StreamRiskAssessment
   @ObservedObject var languageManager = LanguageManager.shared
-  @SwiftUI.State private var isExpanded = false
+  @AppStorage("settings.video.streamRiskSummaryExpanded") private var isExpanded = false
 
   private var riskColor: Color {
     switch assessment.riskLevel {
@@ -2275,12 +2562,33 @@ struct StreamRiskSummarySection: View {
               .foregroundColor(.secondary)
           }
 
+          if let hostRuntimeLabel = assessment.hostRuntimeLabel, !hostRuntimeLabel.isEmpty {
+            Divider()
+
+            HStack {
+              Text(languageManager.localize("Host Runtime"))
+              Spacer()
+              Text(hostRuntimeLabel)
+                .foregroundColor(.secondary)
+            }
+          }
+
           Divider()
 
           HStack {
             Text(languageManager.localize("Video Codec"))
             Spacer()
             Text("\(assessment.codecName) · \(assessment.chromaName)")
+              .foregroundColor(.secondary)
+          }
+
+          Divider()
+
+          HStack {
+            Text(languageManager.localize("Target FPS"))
+            Spacer()
+            Text("\(assessment.targetFps)")
+              .availableMonospacedDigit()
               .foregroundColor(.secondary)
           }
 
@@ -2310,7 +2618,30 @@ struct StreamRiskSummarySection: View {
             HStack {
               Text(languageManager.localize("Display Refresh"))
               Spacer()
-              Text(String(format: "%.0f Hz", assessment.displayRefreshRateHz))
+              Text(String(format: "%.2f Hz", assessment.displayRefreshRateHz))
+                .availableMonospacedDigit()
+                .foregroundColor(.secondary)
+            }
+          }
+
+          if let cadenceLabel = assessment.cadenceLabel, !cadenceLabel.isEmpty {
+            Divider()
+
+            HStack {
+              Text(languageManager.localize("Cadence Match"))
+              Spacer()
+              Text(cadenceLabel)
+                .foregroundColor(.secondary)
+            }
+          }
+
+          if let wirelessLinkText = assessment.wirelessLinkText, !wirelessLinkText.isEmpty {
+            Divider()
+
+            HStack {
+              Text(languageManager.localize("Wireless Link"))
+              Spacer()
+              Text(wirelessLinkText)
                 .availableMonospacedDigit()
                 .foregroundColor(.secondary)
             }
@@ -2390,6 +2721,45 @@ struct ToggleCell: View {
         .toggleStyle(.switch)
         .controlSize(.small)
     }
+  }
+}
+
+private struct DetailedToggleSettingRow: View {
+  let title: String
+  let descriptionKey: String
+  @Binding var boolBinding: Bool
+
+  var body: some View {
+    VStack(alignment: .leading, spacing: 8) {
+      ToggleCell(title: title, boolBinding: $boolBinding)
+      SettingDescriptionRow(textKey: descriptionKey)
+    }
+  }
+}
+
+private struct SettingDescriptionRow: View {
+  let textKey: String
+  var color: Color = .secondary
+  @ObservedObject var languageManager = LanguageManager.shared
+
+  var body: some View {
+    Text(languageManager.localize(textKey))
+      .font(.footnote)
+      .foregroundColor(color)
+      .frame(maxWidth: .infinity, alignment: .leading)
+  }
+}
+
+private struct InlineSectionLabel: View {
+  let title: String
+  @ObservedObject var languageManager = LanguageManager.shared
+
+  var body: some View {
+    Text(languageManager.localize(title))
+      .font(.footnote.weight(.semibold))
+      .foregroundColor(.secondary)
+      .frame(maxWidth: .infinity, alignment: .leading)
+      .padding(.top, 2)
   }
 }
 

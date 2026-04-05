@@ -1,4 +1,5 @@
 import AppKit
+import CoreWLAN
 import CoreGraphics
 import Darwin
 import VideoToolbox
@@ -92,11 +93,31 @@ private struct StreamRiskProfile: Hashable {
 private struct StreamRiskEvaluation {
   let routeTier: StreamRiskRouteTier
   let riskLevel: StreamRiskLevel
+  let hostRuntimeLabel: String?
+  let targetFps: Int
   let pixelRate: Double
   let bitsPerPixelPerFrame: Double
   let decodeSupported: Bool
   let displayRefreshRateHz: Double
+  let cadenceLabel: String?
+  let wirelessLinkText: String?
   let reasons: [String]
+}
+
+private struct StreamCadenceAnalysis {
+  let label: String
+  let addedRisk: StreamRiskLevel?
+  let reason: String?
+}
+
+private struct StreamWirelessLinkInfo {
+  let text: String
+  let addedRisk: StreamRiskLevel?
+  let reason: String?
+}
+
+private struct StreamHostRuntimeInfo {
+  let label: String
 }
 
 @objcMembers final class StreamRiskRecommendation: NSObject {
@@ -136,14 +157,18 @@ private struct StreamRiskEvaluation {
   let riskLevelRawValue: Int
   let routeLabel: String
   let riskLabel: String
+  let hostRuntimeLabel: String?
   let codecName: String
   let chromaName: String
+  let targetFps: Int
   let pixelRate: Double
   let pixelRateText: String
   let bitsPerPixelPerFrame: Double
   let bpppfText: String
   let decodeSupported: Bool
   let displayRefreshRateHz: Double
+  let cadenceLabel: String?
+  let wirelessLinkText: String?
   let summaryLine: String
   let reasons: [String]
   let recommendedFallbacks: [StreamRiskRecommendation]
@@ -156,10 +181,14 @@ private struct StreamRiskEvaluation {
     riskLevel: StreamRiskLevel,
     codecName: String,
     chromaName: String,
+    hostRuntimeLabel: String?,
+    targetFps: Int,
     pixelRate: Double,
     bitsPerPixelPerFrame: Double,
     decodeSupported: Bool,
     displayRefreshRateHz: Double,
+    cadenceLabel: String?,
+    wirelessLinkText: String?,
     summaryLine: String,
     reasons: [String],
     recommendedFallbacks: [StreamRiskRecommendation],
@@ -170,14 +199,18 @@ private struct StreamRiskEvaluation {
     riskLevelRawValue = riskLevel.rawValue
     routeLabel = routeTier.label
     riskLabel = riskLevel.label
+    self.hostRuntimeLabel = hostRuntimeLabel
     self.codecName = codecName
     self.chromaName = chromaName
+    self.targetFps = targetFps
     self.pixelRate = pixelRate
     pixelRateText = StreamRiskAssessor.formatPixelRate(pixelRate)
     self.bitsPerPixelPerFrame = bitsPerPixelPerFrame
     bpppfText = String(format: "%.3f", bitsPerPixelPerFrame)
     self.decodeSupported = decodeSupported
     self.displayRefreshRateHz = displayRefreshRateHz
+    self.cadenceLabel = cadenceLabel
+    self.wirelessLinkText = wirelessLinkText
     self.summaryLine = summaryLine
     self.reasons = reasons
     self.recommendedFallbacks = recommendedFallbacks
@@ -245,10 +278,14 @@ private struct StreamRiskEvaluation {
       riskLevel: evaluation.riskLevel,
       codecName: profile.codec.displayName,
       chromaName: profile.enableYUV444 ? "4:4:4" : "4:2:0",
+      hostRuntimeLabel: evaluation.hostRuntimeLabel,
+      targetFps: evaluation.targetFps,
       pixelRate: evaluation.pixelRate,
       bitsPerPixelPerFrame: evaluation.bitsPerPixelPerFrame,
       decodeSupported: evaluation.decodeSupported,
       displayRefreshRateHz: evaluation.displayRefreshRateHz,
+      cadenceLabel: evaluation.cadenceLabel,
+      wirelessLinkText: evaluation.wirelessLinkText,
       summaryLine: summaryLine,
       reasons: Array(evaluation.reasons.prefix(5)),
       recommendedFallbacks: recommendations,
@@ -265,11 +302,14 @@ private struct StreamRiskEvaluation {
     autoMode: Bool
   ) -> StreamRiskEvaluation {
     let routeTier = classifyRouteTier(host: host, targetAddress: targetAddress)
+    let hostRuntimeInfo = inferredHostRuntimeInfo(host: host)
     let pixelRate = Double(profile.width) * Double(profile.height) * Double(profile.fps)
     let safeBitrateKbps = max(1, bitrateKbps)
     let bitsPerPixelPerFrame = Double(safeBitrateKbps) * 1000.0 / max(pixelRate, 1.0)
     let decodeSupported = hardwareDecodeSupported(for: profile.codec)
     let displayRefreshRateHz = currentDisplayRefreshRateHz()
+    let cadence = cadenceAnalysis(targetFps: profile.fps, displayRefreshRateHz: displayRefreshRateHz)
+    let wirelessLinkInfo = currentWirelessLinkInfo(forTarget: targetAddress)
 
     let thresholds = thresholdsFor(codec: profile.codec)
     let chromaMultiplier = profile.enableYUV444 ? 1.8 : 1.0
@@ -325,10 +365,37 @@ private struct StreamRiskEvaluation {
       riskLevel = maxRisk(riskLevel, refreshRisk)
       reasons.append(
         streamRiskLocalizedFormat(
-          "Target FPS (%d) is above the current display refresh ceiling (%.0f Hz).",
+          "Target FPS (%d) is above the current display refresh ceiling (%.2f Hz).",
           profile.fps,
           displayRefreshRateHz
         ))
+    }
+
+    if let addedRisk = cadence.addedRisk {
+      riskLevel = maxRisk(riskLevel, addedRisk)
+    }
+    if let cadenceReason = cadence.reason {
+      reasons.append(cadenceReason)
+    }
+
+    if let wirelessLinkInfo {
+      if let addedRisk = wirelessLinkInfo.addedRisk {
+        riskLevel = maxRisk(riskLevel, addedRisk)
+      }
+      if let wirelessReason = wirelessLinkInfo.reason {
+        reasons.append(wirelessReason)
+      }
+    }
+
+    if let hostRuntimeInfo,
+       let hostTimingReason = hostTimingGuidanceReason(
+        hostRuntimeInfo: hostRuntimeInfo,
+        targetFps: profile.fps,
+        displayRefreshRateHz: displayRefreshRateHz,
+        cadence: cadence
+       )
+    {
+      reasons.append(hostTimingReason)
     }
 
     switch routeTier {
@@ -359,10 +426,14 @@ private struct StreamRiskEvaluation {
     return StreamRiskEvaluation(
       routeTier: routeTier,
       riskLevel: riskLevel,
+      hostRuntimeLabel: hostRuntimeInfo?.label,
+      targetFps: profile.fps,
       pixelRate: pixelRate,
       bitsPerPixelPerFrame: bitsPerPixelPerFrame,
       decodeSupported: decodeSupported,
       displayRefreshRateHz: displayRefreshRateHz,
+      cadenceLabel: cadence.label,
+      wirelessLinkText: wirelessLinkInfo?.text,
       reasons: reasons
     )
   }
@@ -590,7 +661,7 @@ private struct StreamRiskEvaluation {
       }
       return false
     case .av1:
-      return false
+      return VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
     }
   }
 
@@ -610,6 +681,109 @@ private struct StreamRiskEvaluation {
       return Double(screen.maximumFramesPerSecond)
     }
     return 0
+  }
+
+  private static func cadenceAnalysis(targetFps: Int, displayRefreshRateHz: Double) -> StreamCadenceAnalysis {
+    guard targetFps > 0, displayRefreshRateHz > 0 else {
+      return StreamCadenceAnalysis(label: streamRiskLocalized("Not Available"), addedRisk: nil, reason: nil)
+    }
+
+    let target = Double(targetFps)
+    let refresh = displayRefreshRateHz
+
+    if target > refresh + 0.10 {
+      if abs(target - refresh) <= 0.20 {
+        return StreamCadenceAnalysis(
+          label: streamRiskLocalized("Fractional Mismatch"),
+          addedRisk: .medium,
+          reason: streamRiskLocalizedFormat(
+            "Target FPS (%d) is slightly above the current display refresh (%.2f Hz), which can cause periodic cadence hitches.",
+            targetFps,
+            refresh
+          )
+        )
+      }
+
+      return StreamCadenceAnalysis(
+        label: streamRiskLocalized("Display Ceiling"),
+        addedRisk: nil,
+        reason: nil
+      )
+    }
+
+    let ratio = refresh / target
+    let nearestInteger = round(ratio)
+    if nearestInteger >= 1, abs(ratio - nearestInteger) <= 0.03 {
+      if Int(nearestInteger) <= 1 {
+        return StreamCadenceAnalysis(label: streamRiskLocalized("Matched"), addedRisk: nil, reason: nil)
+      }
+
+      return StreamCadenceAnalysis(
+        label: streamRiskLocalizedFormat("Even %dx cadence", Int(nearestInteger)),
+        addedRisk: nil,
+        reason: nil
+      )
+    }
+
+    return StreamCadenceAnalysis(
+      label: streamRiskLocalized("Uneven Cadence"),
+      addedRisk: .medium,
+      reason: streamRiskLocalizedFormat(
+        "Display refresh (%.2f Hz) does not divide evenly into target FPS (%d), so frame pacing may feel uneven.",
+        refresh,
+        targetFps
+      )
+    )
+  }
+
+  private static func currentWirelessLinkInfo(forTarget targetAddress: String) -> StreamWirelessLinkInfo? {
+    guard !targetAddress.isEmpty else { return nil }
+
+    let egressIf = Utils.outboundInterfaceName(forAddress: targetAddress, sourceAddress: nil) ?? ""
+    guard !egressIf.isEmpty else { return nil }
+
+    let wifiInterface = CWWiFiClient.shared().interface(withName: egressIf)
+    guard let wifiInterface, wifiInterface.powerOn() else { return nil }
+
+    guard let channel = wifiInterface.wlanChannel() else {
+      return StreamWirelessLinkInfo(text: streamRiskLocalized("Wi-Fi (channel unavailable)"), addedRisk: nil, reason: nil)
+    }
+
+    let channelNumber = Int(channel.channelNumber)
+    let bandText: String
+    if channelNumber >= 1 && channelNumber <= 14 {
+      bandText = "2.4 GHz"
+    } else if channelNumber >= 32 && channelNumber <= 196 {
+      bandText = "5 GHz"
+    } else {
+      bandText = streamRiskLocalized("Wi-Fi")
+    }
+
+    let text = "\(bandText) · Ch \(channelNumber)"
+
+    if channelNumber >= 1 && channelNumber <= 14 {
+      return StreamWirelessLinkInfo(
+        text: text,
+        addedRisk: .medium,
+        reason: streamRiskLocalizedFormat(
+          "Wi-Fi is currently on 2.4 GHz (channel %d), which is especially sensitive to AirDrop / AWDL coexistence and jitter.",
+          channelNumber
+        )
+      )
+    }
+
+    if channelNumber >= 32 && channelNumber < 149 {
+      return StreamWirelessLinkInfo(
+        text: text,
+        addedRisk: .medium,
+        reason: streamRiskLocalizedFormat(
+          "Wi-Fi is currently on 5 GHz channel %d. If AirDrop / Handoff is active, AWDL-related jitter is more likely to show up here than on 149+ channels.",
+          channelNumber
+        )
+      )
+    }
+
+    return StreamWirelessLinkInfo(text: text, addedRisk: nil, reason: nil)
   }
 
   fileprivate static func formatPixelRate(_ pixelRate: Double) -> String {
@@ -672,5 +846,56 @@ private struct StreamRiskEvaluation {
     }
 
     return false
+  }
+
+  private static func inferredHostRuntimeInfo(host: TemporaryHost?) -> StreamHostRuntimeInfo? {
+    let haystack = [
+      host?.gfeVersion,
+      host?.appVersion,
+      host?.name,
+      host?.displayName,
+    ]
+    .compactMap { $0?.lowercased() }
+    .joined(separator: "\n")
+
+    guard !haystack.isEmpty else { return nil }
+
+    if haystack.contains("apollo") {
+      return StreamHostRuntimeInfo(label: "Apollo")
+    }
+    if haystack.contains("foundation sunshine") || haystack.contains("sunshine foundation") {
+      return StreamHostRuntimeInfo(label: "Foundation Sunshine")
+    }
+    if haystack.contains("sunshine") {
+      return StreamHostRuntimeInfo(label: "Sunshine")
+    }
+    if haystack.contains("geforce") || haystack.contains("gamestream") || haystack.contains("nvidia") {
+      return StreamHostRuntimeInfo(label: "GameStream / GFE")
+    }
+    return nil
+  }
+
+  private static func hostTimingGuidanceReason(
+    hostRuntimeInfo: StreamHostRuntimeInfo,
+    targetFps: Int,
+    displayRefreshRateHz: Double,
+    cadence: StreamCadenceAnalysis
+  ) -> String? {
+    let cadenceNeedsGuidance =
+      cadence.addedRisk != nil
+      || (displayRefreshRateHz > 0 && Double(targetFps) > displayRefreshRateHz + 0.10)
+
+    guard cadenceNeedsGuidance else { return nil }
+
+    switch hostRuntimeInfo.label {
+    case "Apollo":
+      return streamRiskLocalized("Apollo users usually get steadier pacing from Display Mode Override or a virtual / headless display that matches the stream FPS.")
+    case "Foundation Sunshine":
+      return streamRiskLocalized("Foundation Sunshine users should try refresh remap, VRR, or a matched virtual display when cadence looks uneven.")
+    case "Sunshine":
+      return streamRiskLocalized("Sunshine users often get steadier frame pacing from a virtual display or a host display mode that matches the stream FPS.")
+    default:
+      return nil
+    }
   }
 }

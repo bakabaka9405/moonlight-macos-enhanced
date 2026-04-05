@@ -488,6 +488,10 @@
 				CODE_SIGN_IDENTITY = "iPhone Developer";
 				DEAD_CODE_STRIPPING = YES;
 				EXECUTABLE_PREFIX = lib;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)",
+				);
 				HEADER_SEARCH_PATHS = (
 					"moonlight-common-c/enet/include",
 					"../libs/**",
@@ -507,6 +511,10 @@
 				CODE_SIGN_IDENTITY = "iPhone Distribution";
 				DEAD_CODE_STRIPPING = YES;
 				EXECUTABLE_PREFIX = lib;
+				FRAMEWORK_SEARCH_PATHS = (
+					"$(inherited)",
+					"$(BUILT_PRODUCTS_DIR)",
+				);
 				HEADER_SEARCH_PATHS = (
 					"moonlight-common-c/enet/include",
 					"../libs/**",

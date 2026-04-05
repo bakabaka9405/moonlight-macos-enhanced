@@ -567,6 +567,20 @@ void LogTag(LogLevel level, NSString* tag, NSString* fmt, ...) {
     va_end(args);
 }
 
+void LogMessage(LogLevel level, NSString *message) {
+    NSString *line = FormatLogLine(level, message ?: @"");
+    AppendRawFileLogLine(line);
+    ProcessCuratedLogLine(line, level);
+}
+
+void LogTaggedMessage(LogLevel level, NSString *tag, NSString *message) {
+    NSString *line = tag.length > 0
+        ? [NSString stringWithFormat:@"(%@) %@", tag, message ?: @""]
+        : (message ?: @"");
+    AppendRawFileLogLine(FormatLogLine(level, line));
+    ProcessCuratedLogLine(FormatLogLine(level, line), level);
+}
+
 void LogTagv(LogLevel level, NSString* tag, NSString* fmt, va_list args) {
     NSString *levelPrefix = LogPrefixForLevel(level);
     if (levelPrefix.length == 0) {

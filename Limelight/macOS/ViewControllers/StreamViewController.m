@@ -70,7 +70,7 @@ static CGFloat const MLEdgeMenuInteractionVerticalPadding = 28.0;
 static NSTimeInterval const MLEdgeMenuAutoCollapseDelay = 0.82;
 static CGFloat const MLFreeMouseReentryDelayMs = 140.0;
 static CGFloat const MLFreeMouseReentryInset = 32.0;
-static BOOL const MLUseOnScreenControlCenterEntrypoints = NO;
+static BOOL const MLUseOnScreenControlCenterEntrypoints = YES;
 static BOOL const MLUseFloatingControlOrb = YES;
 
 static NSEventModifierFlags MLRelevantShortcutModifiers(NSEventModifierFlags flags) {
@@ -1368,6 +1368,145 @@ highFreqMotor:(unsigned short)highFreqMotor {
     return self.menuTitlebarAccessoryInstalled;
 }
 
+- (void)buildMenuTitlebarAccessoryIfNeeded {
+    if (self.menuTitlebarAccessory != nil) {
+        return;
+    }
+
+    const CGFloat containerWidth = 240.0;
+    const CGFloat containerHeight = 28.0;
+
+    NSView *container = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, containerWidth, containerHeight)];
+    container.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    container.autoresizesSubviews = YES;
+
+    NSVisualEffectView *pill = [[NSVisualEffectView alloc] initWithFrame:container.bounds];
+    pill.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    pill.material = NSVisualEffectMaterialHUDWindow;
+    pill.blendingMode = NSVisualEffectBlendingModeWithinWindow;
+    pill.state = NSVisualEffectStateActive;
+    pill.wantsLayer = YES;
+    pill.layer.cornerRadius = containerHeight * 0.5;
+    pill.layer.masksToBounds = YES;
+    [container addSubview:pill];
+
+    NSView *content = [[NSView alloc] initWithFrame:pill.bounds];
+    content.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    [pill addSubview:content];
+
+    NSImageView *signalImageView = [[NSImageView alloc] initWithFrame:NSMakeRect(10.0, 6.0, 16.0, 16.0)];
+    signalImageView.imageScaling = NSImageScaleProportionallyUpOrDown;
+    signalImageView.contentTintColor = [NSColor whiteColor];
+    [content addSubview:signalImageView];
+
+    NSTextField *timeLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(32.0, 6.0, 70.0, 16.0)];
+    timeLabel.bezeled = NO;
+    timeLabel.drawsBackground = NO;
+    timeLabel.editable = NO;
+    timeLabel.selectable = NO;
+    timeLabel.alignment = NSTextAlignmentLeft;
+    timeLabel.font = [NSFont monospacedDigitSystemFontOfSize:13.0 weight:NSFontWeightRegular];
+    timeLabel.textColor = [NSColor whiteColor];
+    timeLabel.stringValue = @"00:00";
+    [content addSubview:timeLabel];
+
+    NSTextField *titleLabel = [[NSTextField alloc] initWithFrame:NSMakeRect(containerWidth - 88.0, 6.0, 78.0, 16.0)];
+    titleLabel.bezeled = NO;
+    titleLabel.drawsBackground = NO;
+    titleLabel.editable = NO;
+    titleLabel.selectable = NO;
+    titleLabel.alignment = NSTextAlignmentRight;
+    titleLabel.font = [NSFont systemFontOfSize:13.0 weight:NSFontWeightSemibold];
+    titleLabel.textColor = [NSColor whiteColor];
+    titleLabel.lineBreakMode = NSLineBreakByTruncatingTail;
+    titleLabel.stringValue = [self currentStreamHealthBadgeText];
+    [content addSubview:titleLabel];
+
+    NSButton *button = [NSButton buttonWithTitle:@"" target:self action:@selector(handleTitlebarControlCenterPressed:)];
+    button.frame = container.bounds;
+    button.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+    button.bordered = NO;
+    button.imagePosition = NSNoImage;
+    button.title = @"";
+    button.focusRingType = NSFocusRingTypeNone;
+    if ([button respondsToSelector:@selector(setRefusesFirstResponder:)]) {
+        button.refusesFirstResponder = YES;
+    }
+
+    [container addSubview:button];
+
+    NSTitlebarAccessoryViewController *accessory = [[NSTitlebarAccessoryViewController alloc] init];
+    accessory.layoutAttribute = NSLayoutAttributeRight;
+    accessory.view = container;
+
+    self.menuTitlebarAccessory = accessory;
+    self.menuTitlebarButton = button;
+    self.controlCenterPill = pill;
+    self.controlCenterSignalImageView = signalImageView;
+    self.controlCenterTimeLabel = timeLabel;
+    self.controlCenterTitleLabel = titleLabel;
+}
+
+- (void)removeMenuTitlebarAccessoryFromWindowIfNeeded {
+    if (!self.menuTitlebarAccessory) {
+        return;
+    }
+
+    NSWindow *window = self.view.window;
+    if (window &&
+        [self isMenuTitlebarAccessoryInstalledInWindow:window] &&
+        [window respondsToSelector:@selector(setTitlebarAccessoryViewControllers:)]) {
+        @try {
+            NSMutableArray *controllers = [[window titlebarAccessoryViewControllers] mutableCopy];
+            [controllers removeObject:self.menuTitlebarAccessory];
+            [window setValue:[controllers copy] forKey:@"titlebarAccessoryViewControllers"];
+        } @catch (NSException *exception) {
+        }
+    }
+
+    self.menuTitlebarAccessory.view.hidden = YES;
+    self.menuTitlebarAccessoryInstalled = window ? [self isMenuTitlebarAccessoryInstalledInWindow:window] : NO;
+}
+
+- (void)ensureMenuTitlebarAccessoryInstalledIfNeeded {
+    if (!MLUseOnScreenControlCenterEntrypoints) {
+        return;
+    }
+
+    NSWindow *window = self.view.window;
+    if (![self windowAllowsTitlebarAccessories:window] ||
+        [self isWindowFullscreen] ||
+        [self isWindowBorderlessMode] ||
+        ![self isWindowInCurrentSpace]) {
+        [self removeMenuTitlebarAccessoryFromWindowIfNeeded];
+        return;
+    }
+
+    [self buildMenuTitlebarAccessoryIfNeeded];
+
+    if (![self isMenuTitlebarAccessoryInstalledInWindow:window]) {
+        @try {
+            [window addTitlebarAccessoryViewController:self.menuTitlebarAccessory];
+            self.menuTitlebarAccessoryInstalled = YES;
+        } @catch (NSException *exception) {
+            self.menuTitlebarAccessoryInstalled = NO;
+            return;
+        }
+    }
+
+    self.menuTitlebarAccessory.view.hidden = NO;
+    [self updateControlCenterStatus];
+    [self updateControlCenterEntrypointHints];
+}
+
+- (void)handleTitlebarControlCenterPressed:(id)sender {
+    if (self.menuTitlebarButton) {
+        [self presentStreamMenuFromView:self.menuTitlebarButton event:nil];
+    } else {
+        [self presentStreamMenuFromView:self.view event:nil];
+    }
+}
+
 - (void)enterBorderlessPresentationOptionsIfNeeded {
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
@@ -1550,7 +1689,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
                     object:nil
                      queue:[NSOperationQueue mainQueue]
                 usingBlock:^(NSNotification *note) {
-        __strong typeof(self) strongSelf = weakSelf;
+        __strong typeof(weakSelf) strongSelf = weakSelf;
         if (!strongSelf) {
             return;
         }
@@ -2165,6 +2304,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
 
     [self stopStreamHealthDiagnostics];
     [self logStreamHealthSummaryWithReason:[NSString stringWithFormat:@"begin-stop:%@", reason ?: @"unknown"]];
+    [[AwdlHelperManager sharedManager] endStreamSessionWithReason:reason ?: @"begin-stop"];
 
     self.hidSupport.shouldSendInputEvents = NO;
     self.controllerSupport.shouldSendInputEvents = NO;
@@ -2363,6 +2503,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)dealloc {
+    [[AwdlHelperManager sharedManager] endStreamSessionWithReason:@"stream-view-controller-dealloc"];
     [[NSNotificationCenter defaultCenter] removeObserver:self.windowDidExitFullScreenNotification];
     [[NSNotificationCenter defaultCenter] removeObserver:self.windowDidEnterFullScreenNotification];
     [[NSNotificationCenter defaultCenter] removeObserver:self.windowDidResignKeyNotification];
@@ -2396,6 +2537,14 @@ highFreqMotor:(unsigned short)highFreqMotor {
         [self.controlCenterTimer invalidate];
         self.controlCenterTimer = nil;
     }
+
+    [self removeMenuTitlebarAccessoryFromWindowIfNeeded];
+    self.menuTitlebarAccessory = nil;
+    self.menuTitlebarButton = nil;
+    self.controlCenterPill = nil;
+    self.controlCenterSignalImageView = nil;
+    self.controlCenterTimeLabel = nil;
+    self.controlCenterTitleLabel = nil;
 
     [self.edgeMenuAutoCollapseTimer invalidate];
     self.edgeMenuAutoCollapseTimer = nil;
@@ -3839,9 +3988,6 @@ highFreqMotor:(unsigned short)highFreqMotor {
 }
 
 - (void)updateStreamMenuEntrypointsVisibility {
-    if (!MLUseFloatingControlOrb) {
-        return;
-    }
     if (![NSThread isMainThread]) {
         dispatch_async(dispatch_get_main_queue(), ^{
             [self updateStreamMenuEntrypointsVisibility];
@@ -3852,16 +3998,27 @@ highFreqMotor:(unsigned short)highFreqMotor {
         return;
     }
     if (![self isWindowInCurrentSpace]) {
+        [self removeMenuTitlebarAccessoryFromWindowIfNeeded];
         [self hideEdgeMenuForInactiveSpaceIfNeeded];
         return;
     }
     if (self.fullscreenTransitionInProgress) {
+        [self removeMenuTitlebarAccessoryFromWindowIfNeeded];
         self.edgeMenuButton.hidden = YES;
         [self.edgeMenuPanel orderOut:nil];
         return;
     }
     if (self.edgeMenuDragging) {
-        [self.edgeMenuPanel orderFront:nil];
+        [self ensureMenuTitlebarAccessoryInstalledIfNeeded];
+        if (MLUseFloatingControlOrb) {
+            [self.edgeMenuPanel orderFront:nil];
+        }
+        return;
+    }
+
+    [self ensureMenuTitlebarAccessoryInstalledIfNeeded];
+
+    if (!MLUseFloatingControlOrb) {
         return;
     }
 
@@ -4158,9 +4315,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
         }
 
         // Titlebar accessories can cause AppKit assertions when switching to borderless.
-        if (self.menuTitlebarAccessory) {
-            self.menuTitlebarAccessory.view.hidden = YES;
-        }
+        [self removeMenuTitlebarAccessoryFromWindowIfNeeded];
 
         NSWindowStyleMask newMask = window.styleMask;
         newMask &= ~(NSWindowStyleMaskTitled | NSWindowStyleMaskClosable | NSWindowStyleMaskMiniaturizable | NSWindowStyleMaskResizable);
@@ -6119,10 +6274,30 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     }
     streamConfig.optimizeGameSettings = streamSettings.optimizeGames;
     streamConfig.playAudioOnPC = streamSettings.playAudioOnPC;
-    streamConfig.allowHevc = streamSettings.useHevc;
-    streamConfig.enableHdr = streamSettings.useHevc && VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC) ? streamSettings.enableHdr : NO;
+    NSInteger codecPreference = [SettingsClass videoCodecFor:self.app.host.uuid];
+    streamConfig.videoCodecPreference = (int)MAX(0, MIN(codecPreference, 2));
 
-    NSString *codecName = streamConfig.allowHevc ? @"H.265" : @"H.264";
+    BOOL hevcDecodeSupported = NO;
+    if (@available(iOS 11.3, tvOS 11.3, macOS 10.14, *)) {
+        hevcDecodeSupported = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
+    }
+    BOOL av1DecodeSupported = VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1);
+
+    streamConfig.allowHevc = streamConfig.videoCodecPreference != 0;
+    if (streamConfig.videoCodecPreference == 2) {
+        streamConfig.enableHdr = streamSettings.enableHdr && av1DecodeSupported;
+    } else if (streamConfig.videoCodecPreference == 1) {
+        streamConfig.enableHdr = streamSettings.enableHdr && hevcDecodeSupported;
+    } else {
+        streamConfig.enableHdr = NO;
+    }
+
+    NSString *codecName = @"H.264";
+    if (streamConfig.videoCodecPreference == 2) {
+        codecName = @"AV1";
+    } else if (streamConfig.videoCodecPreference == 1) {
+        codecName = @"H.265";
+    }
     self.currentStreamRiskAssessment = [StreamRiskAssessor assessWithHost:self.app.host
                                                             targetAddress:streamConfig.host
                                                          connectionMethod:selectedConnectionMethod
@@ -6143,8 +6318,12 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
         StreamRiskRecommendation *firstRecommendation = self.currentStreamRiskAssessment.recommendedFallbacks.firstObject;
         Log(LOG_I, @"[diag] Recommended fallback: %@", firstRecommendation.summaryLine ?: @"(none)");
     }
-    if ((self.app.host.serverCodecModeSupport & SCM_MASK_AV1) != 0) {
-        Log(LOG_I, @"[diag] Server advertises AV1, but macOS client UI does not expose AV1 selection yet");
+    if (streamConfig.videoCodecPreference == 2) {
+        Log(LOG_I, @"[diag] AV1 preference: serverAdvertises=%d localDecode=%d hdr=%d yuv444=%d",
+            (self.app.host.serverCodecModeSupport & SCM_MASK_AV1) != 0 ? 1 : 0,
+            av1DecodeSupported ? 1 : 0,
+            streamConfig.enableHdr ? 1 : 0,
+            enableYuv444 ? 1 : 0);
     }
 
     streamConfig.multiController = streamSettings.multiController;
@@ -6159,10 +6338,26 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     }
     streamConfig.audioConfiguration = audioConfig;
     
+    streamConfig.framePacingMode = (int)[SettingsClass framePacingFor:self.app.host.uuid];
+    streamConfig.smoothnessLatencyMode = (int)[SettingsClass smoothnessLatencyModeFor:self.app.host.uuid];
+    streamConfig.timingBufferLevel = (int)[SettingsClass timingBufferLevelFor:self.app.host.uuid];
+    streamConfig.timingPrioritizeResponsiveness = [SettingsClass timingPrioritizeResponsivenessFor:self.app.host.uuid];
+    streamConfig.timingCompatibilityMode = [SettingsClass timingCompatibilityModeFor:self.app.host.uuid];
+    streamConfig.timingSdrCompatibilityWorkaround = [SettingsClass timingSdrCompatibilityWorkaroundFor:self.app.host.uuid];
     streamConfig.enableVsync = [SettingsClass enableVsyncFor:self.app.host.uuid];
     streamConfig.showPerformanceOverlay = [SettingsClass showPerformanceOverlayFor:self.app.host.uuid];
     streamConfig.gamepadMouseMode = [SettingsClass gamepadMouseModeFor:self.app.host.uuid];
     streamConfig.upscalingMode = (int)[SettingsClass upscalingModeFor:self.app.host.uuid];
+    Log(LOG_I, @"[diag] Stream timing config: preset=%d framePacing=%d buffer=%d responsiveness=%d compatibility=%d vsync=%d sdrCompat=%d",
+        (int)streamConfig.smoothnessLatencyMode,
+        (int)streamConfig.framePacingMode,
+        (int)streamConfig.timingBufferLevel,
+        streamConfig.timingPrioritizeResponsiveness ? 1 : 0,
+        streamConfig.timingCompatibilityMode ? 1 : 0,
+        streamConfig.enableVsync ? 1 : 0,
+        streamConfig.timingSdrCompatibilityWorkaround ? 1 : 0);
+    [[AwdlHelperManager sharedManager] beginStreamSessionIfEnabled:[SettingsClass awdlStabilityHelperEnabled]
+                                                        generation:streamGeneration];
 
     if (self.useSystemControllerDriver) {
 
@@ -6877,7 +7072,7 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
         Log(LOG_I, @"Reconnect stop took %.3fs", CACurrentMediaTime() - stopStart);
 
         dispatch_async(dispatch_get_main_queue(), ^{
-            __strong typeof(self) strongSelf = weakSelf;
+            __strong typeof(weakSelf) strongSelf = weakSelf;
             if (!strongSelf) {
                 return;
             }
@@ -6981,6 +7176,12 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
             codecString = @"HEVC 10-bit";
         } else {
             codecString = @"HEVC";
+        }
+    } else if (videoFormat & VIDEO_FORMAT_MASK_AV1) {
+        if (videoFormat & VIDEO_FORMAT_MASK_10BIT) {
+            codecString = @"AV1 10-bit";
+        } else {
+            codecString = @"AV1";
         }
     }
 
@@ -7365,6 +7566,7 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     [self stopStreamHealthDiagnostics];
     self.streamHealthConnectionStartedMs = 0;
     [self logStreamHealthSummaryWithReason:[NSString stringWithFormat:@"connection-terminated:%d", errorCode]];
+    [[AwdlHelperManager sharedManager] endStreamSessionWithReason:[NSString stringWithFormat:@"connection-terminated:%d", errorCode]];
 
     // Notify session manager
     if (self.app.host.uuid) {
@@ -7428,6 +7630,7 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     self.connectWatchdogToken += 1;
     [self stopStreamHealthDiagnostics];
     self.streamHealthConnectionStartedMs = 0;
+    [[AwdlHelperManager sharedManager] endStreamSessionWithReason:[NSString stringWithFormat:@"stage-failed:%s", stageName ?: "unknown"]];
     if (self.streamMan) {
         __weak typeof(self) weakSelf = self;
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
@@ -7441,6 +7644,7 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
     self.connectWatchdogToken += 1;
     [self stopStreamHealthDiagnostics];
     self.streamHealthConnectionStartedMs = 0;
+    [[AwdlHelperManager sharedManager] endStreamSessionWithReason:@"launch-failed"];
     if (self.streamMan) {
         __weak typeof(self) weakSelf = self;
         dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{

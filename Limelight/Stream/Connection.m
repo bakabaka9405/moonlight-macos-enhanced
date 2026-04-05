@@ -7,6 +7,7 @@
 //
 
 #import "Connection.h"
+#import "LogBuffer.h"
 #import "Utils.h"
 
 #import "Moonlight-Swift.h"
@@ -75,6 +76,7 @@
     float _audioVolumeMultiplier;
     NSString *_hostAddress;
     int _currentUpscalingMode;
+    StreamConfiguration *_rendererStreamConfig;
     os_unfair_lock _stateLock;
 
     AudioQueueRef _audioQueue;
@@ -239,7 +241,10 @@ int DrDecoderSetup(int videoFormat, int width, int height, int redrawRate, void*
     if (renderer == nil) {
         return -1;
     }
-    [renderer setupWithVideoFormat:videoFormat frameRate:redrawRate upscalingMode:conn->_currentUpscalingMode];
+    [renderer setupWithVideoFormat:videoFormat
+                         frameRate:redrawRate
+                     upscalingMode:conn->_currentUpscalingMode
+                      streamConfig:conn->_rendererStreamConfig];
     return 0;
 }
 
@@ -529,21 +534,35 @@ void ClConnectionStarted(void)
 {
     Connection *conn = CurrentConnection();
     id<ConnectionCallbacks> callbacks = ConnectionGetCallbacksSnapshot(conn);
-    if (callbacks) {
-        [callbacks connectionStarted];
+    Log(LOG_I, @"[diag] ClConnectionStarted: conn=%p callbacks=%p", conn, callbacks);
+    if (!callbacks) {
+        return;
     }
 
-#if defined(LI_MIC_CONTROL_START)
-    // Start microphone after the stream is fully established
-    // Use weak reference to avoid retaining the connection if it's deallocated before dispatch
+    PML_CONNECTION_CONTEXT callbackCtx = conn != nil ? &conn->_connectionContext : NULL;
     __weak Connection *weakMicConn = conn;
-    dispatch_async(dispatch_get_main_queue(), ^{
-        __strong Connection *micConn = weakMicConn;
-        if (micConn) {
-            [micConn startMicrophoneIfNeeded];
+    dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_HIGH, 0), ^{
+        if (callbackCtx != NULL) {
+            LiSetThreadConnectionContext(callbackCtx);
+        }
+
+        Log(LOG_I, @"[diag] ClConnectionStarted dispatch begin: conn=%p callbacks=%p", conn, callbacks);
+        [callbacks connectionStarted];
+        Log(LOG_I, @"[diag] ClConnectionStarted callback returned");
+
+#if defined(LI_MIC_CONTROL_START)
+        dispatch_async(dispatch_get_main_queue(), ^{
+            __strong Connection *micConn = weakMicConn;
+            if (micConn) {
+                [micConn startMicrophoneIfNeeded];
+            }
+        });
+#endif
+
+        if (callbackCtx != NULL) {
+            LiSetThreadConnectionContext(NULL);
         }
     });
-#endif
 }
 
 void ClConnectionTerminated(int errorCode)
@@ -586,11 +605,47 @@ void ClLogMessage(const char* format, ...)
 
     va_list va;
     va_start(va, format);
-    vfprintf(stderr, format, va);
+
+    va_list stderrArgs;
+    va_copy(stderrArgs, va);
+    vfprintf(stderr, format, stderrArgs);
+    va_end(stderrArgs);
+
+    va_list formatArgs;
+    va_copy(formatArgs, va);
+    char stackBuffer[2048];
+    int requiredLength = vsnprintf(stackBuffer, sizeof(stackBuffer), format, formatArgs);
+    va_end(formatArgs);
+
+    NSString *formattedLine = nil;
+    if (requiredLength >= 0 && requiredLength < (int)sizeof(stackBuffer)) {
+        formattedLine = [NSString stringWithUTF8String:stackBuffer];
+    } else if (requiredLength >= (int)sizeof(stackBuffer)) {
+        size_t heapLength = (size_t)requiredLength + 1;
+        char *heapBuffer = malloc(heapLength);
+        if (heapBuffer != NULL) {
+            va_list heapArgs;
+            va_copy(heapArgs, va);
+            vsnprintf(heapBuffer, heapLength, format, heapArgs);
+            va_end(heapArgs);
+            formattedLine = [NSString stringWithUTF8String:heapBuffer];
+            free(heapBuffer);
+        }
+    }
+
     va_end(va);
-    
+
+    if (formattedLine.length > 0) {
+        NSString *trimmedLine = [formattedLine stringByTrimmingCharactersInSet:[NSCharacterSet newlineCharacterSet]];
+        if (trimmedLine.length > 0) {
+            [[LogBuffer shared] appendLine:trimmedLine level:isDropLog ? LOG_W : LOG_I];
+        }
+    }
+
     if (isDropLog && accumulatedDropCount > 1) {
-        fprintf(stderr, " (and %d more dropped frame messages suppressed)\n", accumulatedDropCount - 1);
+        NSString *summaryLine = [NSString stringWithFormat:@"(and %d more dropped frame messages suppressed)", accumulatedDropCount - 1];
+        fprintf(stderr, " %s\n", summaryLine.UTF8String);
+        [[LogBuffer shared] appendLine:summaryLine level:LOG_W];
         accumulatedDropCount = 0;
     }
 }
@@ -705,6 +760,7 @@ void ClConnectionStatusUpdate(int status)
     ConnectionSetRenderer(self, myRenderer);
     ConnectionSetCallbacks(self, callbacks);
     _currentUpscalingMode = config.upscalingMode;
+    _rendererStreamConfig = config;
 
     memset(&_connectionContext, 0, sizeof(_connectionContext));
 
@@ -858,13 +914,16 @@ void ClConnectionStatusUpdate(int status)
     // As a result, we will only use HEVC on iOS 11.3 or later.
 #if defined(VIDEO_FORMAT_H264_HIGH8_444)
     // Newer moonlight-common-c uses supportedVideoFormats for codec negotiation.
-    BOOL hevcSupported = NO;
+    int codecPreference = config.videoCodecPreference;
+    BOOL hevcDecodeSupported = NO;
     if (@available(iOS 11.3, tvOS 11.3, macOS 10.14, *)) {
-        hevcSupported = config.allowHevc && VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
+        hevcDecodeSupported = VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
     }
+    BOOL hevcSupported = codecPreference >= 1 && hevcDecodeSupported;
+    BOOL av1Supported = codecPreference >= 2 && VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1);
 
-    // If HDR is requested, HEVC decode support is required.
-    assert(!config.enableHdr || hevcSupported);
+    // If HDR is requested, at least one 10-bit codec path must be available.
+    assert(!config.enableHdr || hevcSupported || av1Supported);
 
     BOOL enableYuv444 = NO;
     @try {
@@ -900,7 +959,22 @@ void ClConnectionStatusUpdate(int status)
         }
     }
 
+    if (av1Supported && !enableYuv444) {
+        if (config.enableHdr) {
+            supportedVideoFormats |= VIDEO_FORMAT_AV1_MAIN10;
+        } else {
+            supportedVideoFormats |= VIDEO_FORMAT_AV1_MAIN8;
+        }
+    }
+
     _streamConfig.supportedVideoFormats = supportedVideoFormats;
+    Log(LOG_I, @"[diag] Codec preference resolved: pref=%d av1=%d hevc=%d hdr=%d yuv444=%d formats=0x%X",
+        codecPreference,
+        av1Supported ? 1 : 0,
+        hevcSupported ? 1 : 0,
+        config.enableHdr ? 1 : 0,
+        enableYuv444 ? 1 : 0,
+        supportedVideoFormats);
 #else
     if (@available(iOS 11.3, tvOS 11.3, macOS 10.14, *)) {
         _streamConfig.supportsHevc = config.allowHevc && VTIsHardwareDecodeSupported(kCMVideoCodecType_HEVC);
@@ -923,7 +997,9 @@ void ClConnectionStatusUpdate(int status)
 //#if TARGET_OS_IPHONE
     // RFI doesn't work properly with HEVC on iOS 11 with an iPhone SE (at least)
     // It doesnt work on macOS either, tested with Network Link Conditioner.
-    _drCallbacks.capabilities = CAPABILITY_PULL_RENDERER;
+    _drCallbacks.capabilities = CAPABILITY_PULL_RENDERER |
+                                CAPABILITY_REFERENCE_FRAME_INVALIDATION_HEVC |
+                                CAPABILITY_REFERENCE_FRAME_INVALIDATION_AV1;
 //#endif
 
     LiInitializeAudioCallbacks(&_arCallbacks);

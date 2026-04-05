@@ -9,5 +9,5 @@
 #import "StreamConfiguration.h"
 
 @implementation StreamConfiguration
-@synthesize host, appID, width, height, frameRate, bitRate, autoAdjustBitrate, riKeyId, riKey, gamepadMask, streamingRemotely, appName, optimizeGameSettings, playAudioOnPC, audioConfiguration, enableHdr, enableVsync, showPerformanceOverlay, multiController, allowHevc, serverCert, serverCodecModeSupport;
+@synthesize host, appID, width, height, frameRate, bitRate, autoAdjustBitrate, riKeyId, riKey, gamepadMask, streamingRemotely, appName, optimizeGameSettings, playAudioOnPC, audioConfiguration, enableHdr, enableVsync, framePacingMode, smoothnessLatencyMode, timingBufferLevel, timingPrioritizeResponsiveness, timingCompatibilityMode, timingSdrCompatibilityWorkaround, showPerformanceOverlay, multiController, allowHevc, videoCodecPreference, serverCert, serverCodecModeSupport;
 @end

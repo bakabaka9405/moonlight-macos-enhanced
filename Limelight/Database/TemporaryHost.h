@@ -26,6 +26,8 @@ NS_ASSUME_NONNULL_BEGIN
 @property(atomic, nullable, retain) NSString *localAddress;
 @property(atomic, nullable, retain) NSString *ipv6Address;
 @property(atomic, nullable, retain) NSString *mac;
+@property(atomic, nullable, retain) NSString *appVersion;
+@property(atomic, nullable, retain) NSString *gfeVersion;
 @property(atomic) int serverCodecModeSupport;
 
 @property(atomic, retain)

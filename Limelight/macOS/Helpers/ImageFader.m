@@ -21,8 +21,7 @@
     [newImageView.bottomAnchor constraintEqualToAnchor:containerView.bottomAnchor].active = YES;
     [newImageView.leadingAnchor constraintEqualToAnchor:containerView.leadingAnchor].active = YES;
     [newImageView.trailingAnchor constraintEqualToAnchor:containerView.trailingAnchor].active = YES;
-
-    [newImageView layoutSubtreeIfNeeded];
+    [containerView setNeedsLayout:YES];
 
     newImageView.image = image;
 

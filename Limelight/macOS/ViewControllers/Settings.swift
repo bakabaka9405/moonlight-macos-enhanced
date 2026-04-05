@@ -326,6 +326,11 @@ struct Settings: Encodable, Decodable {
   let streamShortcuts: [String: StreamShortcut]?
   let upscalingMode: Int?
   let connectionMethod: String?
+  let smoothnessLatencyMode: Int?
+  let timingBufferLevel: Int?
+  let timingPrioritizeResponsiveness: Bool?
+  let timingCompatibilityMode: Bool?
+  let timingSdrCompatibilityWorkaround: Bool?
 
   private static func globalProfileKey() -> String {
     SettingsClass.profileKey(for: SettingsModel.globalHostId)
@@ -384,7 +389,12 @@ struct Settings: Encodable, Decodable {
       pointerSensitivity: pointerSensitivity,
       streamShortcuts: streamShortcuts,
       upscalingMode: upscalingMode,
-      connectionMethod: nil
+      connectionMethod: nil,
+      smoothnessLatencyMode: smoothnessLatencyMode,
+      timingBufferLevel: timingBufferLevel,
+      timingPrioritizeResponsiveness: timingPrioritizeResponsiveness,
+      timingCompatibilityMode: timingCompatibilityMode,
+      timingSdrCompatibilityWorkaround: timingSdrCompatibilityWorkaround
     )
   }
 
@@ -506,7 +516,12 @@ class SettingsClass: NSObject {
       pointerSensitivity: settings.pointerSensitivity,
       streamShortcuts: streamShortcuts ?? settings.streamShortcuts,
       upscalingMode: settings.upscalingMode,
-      connectionMethod: connectionMethod ?? settings.connectionMethod
+      connectionMethod: connectionMethod ?? settings.connectionMethod,
+      smoothnessLatencyMode: settings.smoothnessLatencyMode,
+      timingBufferLevel: settings.timingBufferLevel,
+      timingPrioritizeResponsiveness: settings.timingPrioritizeResponsiveness,
+      timingCompatibilityMode: settings.timingCompatibilityMode,
+      timingSdrCompatibilityWorkaround: settings.timingSdrCompatibilityWorkaround
     )
   }
 
@@ -566,6 +581,11 @@ class SettingsClass: NSObject {
         "upscalingMode": settings.upscalingMode,
         // Single source of truth: Settings.connectionMethod (persisted by SettingsModel)
         "connectionMethod": settings.connectionMethod ?? "Auto",
+        "smoothnessLatencyMode": settings.smoothnessLatencyMode,
+        "timingBufferLevel": settings.timingBufferLevel,
+        "timingPrioritizeResponsiveness": settings.timingPrioritizeResponsiveness,
+        "timingCompatibilityMode": settings.timingCompatibilityMode,
+        "timingSdrCompatibilityWorkaround": settings.timingSdrCompatibilityWorkaround,
       ]
 
       return objcSettings.compactMapValues { $0 }
@@ -676,7 +696,12 @@ class SettingsClass: NSObject {
       pointerSensitivity: settings.pointerSensitivity,
       streamShortcuts: settings.streamShortcuts,
       upscalingMode: settings.upscalingMode,
-      connectionMethod: settings.connectionMethod
+      connectionMethod: settings.connectionMethod,
+      smoothnessLatencyMode: settings.smoothnessLatencyMode,
+      timingBufferLevel: settings.timingBufferLevel,
+      timingPrioritizeResponsiveness: settings.timingPrioritizeResponsiveness,
+      timingCompatibilityMode: settings.timingCompatibilityMode,
+      timingSdrCompatibilityWorkaround: settings.timingSdrCompatibilityWorkaround
     )
 
     // Recalculate bitrate if auto is enabled, since resolution changed
@@ -739,7 +764,12 @@ class SettingsClass: NSObject {
         pointerSensitivity: updated.pointerSensitivity,
         streamShortcuts: updated.streamShortcuts,
         upscalingMode: updated.upscalingMode,
-        connectionMethod: updated.connectionMethod
+        connectionMethod: updated.connectionMethod,
+        smoothnessLatencyMode: updated.smoothnessLatencyMode,
+        timingBufferLevel: updated.timingBufferLevel,
+        timingPrioritizeResponsiveness: updated.timingPrioritizeResponsiveness,
+        timingCompatibilityMode: updated.timingCompatibilityMode,
+        timingSdrCompatibilityWorkaround: updated.timingSdrCompatibilityWorkaround
       )
     }
 
@@ -810,7 +840,12 @@ class SettingsClass: NSObject {
       pointerSensitivity: settings.pointerSensitivity,
       streamShortcuts: settings.streamShortcuts,
       upscalingMode: settings.upscalingMode,
-      connectionMethod: settings.connectionMethod
+      connectionMethod: settings.connectionMethod,
+      smoothnessLatencyMode: settings.smoothnessLatencyMode,
+      timingBufferLevel: settings.timingBufferLevel,
+      timingPrioritizeResponsiveness: settings.timingPrioritizeResponsiveness,
+      timingCompatibilityMode: settings.timingCompatibilityMode,
+      timingSdrCompatibilityWorkaround: settings.timingSdrCompatibilityWorkaround
     )
 
     // Recalculate bitrate if auto is enabled
@@ -853,7 +888,7 @@ class SettingsClass: NSObject {
       remoteFps: remoteFpsEnabled,
       remoteFpsRate: .some(explicitRemoteFps),
       codec: codec,
-      hdr: codec == 1 ? settings.hdr : false
+      hdr: codec != 0 ? settings.hdr : false
     )
 
     persist(updated, for: key)
@@ -954,7 +989,7 @@ class SettingsClass: NSObject {
       }
       let dataFps = settings.fps == .zero ? Int(settings.customFps ?? 60.0) : settings.fps
       let dataBitrate = settings.bitrate
-      let dataCodec = SettingsModel.getBool(from: settings.codec, in: SettingsModel.videoCodecs)
+      let dataCodec = settings.codec != 0
 
       // TODO: Add this back when VideoDecoderRenderer gets merged, with frame pacing setting check
       //            let dataFramePacing = SettingsModel.getBool(from: settings.framePacing, in: SettingsModel.pacingOptions)
@@ -1121,11 +1156,77 @@ class SettingsClass: NSObject {
     return 0  // Stereo default
   }
 
+  @objc static func videoCodec(for key: String) -> Int {
+    if let settings = Settings.getSettings(for: key) {
+      return settings.codec
+    }
+
+    return SettingsModel.getInt(
+      from: SettingsModel.defaultVideoCodec,
+      in: SettingsModel.videoCodecs)
+  }
+
   @objc static func enableVsync(for key: String) -> Bool {
     if let settings = Settings.getSettings(for: key) {
       return settings.enableVsync ?? SettingsModel.defaultEnableVsync
     }
     return SettingsModel.defaultEnableVsync
+  }
+
+  @objc static func framePacing(for key: String) -> Int {
+    if let settings = Settings.getSettings(for: key) {
+      return settings.framePacing
+    }
+    return SettingsModel.getInt(
+      from: SettingsModel.defaultPacingOptions,
+      in: SettingsModel.pacingOptions)
+  }
+
+  @objc static func smoothnessLatencyMode(for key: String) -> Int {
+    if let settings = Settings.getSettings(for: key) {
+      return settings.smoothnessLatencyMode
+        ?? SettingsModel.getInt(
+          from: SettingsModel.defaultSmoothnessLatencyMode,
+          in: SettingsModel.smoothnessLatencyModes)
+    }
+    return SettingsModel.getInt(
+      from: SettingsModel.defaultSmoothnessLatencyMode,
+      in: SettingsModel.smoothnessLatencyModes)
+  }
+
+  @objc static func timingBufferLevel(for key: String) -> Int {
+    if let settings = Settings.getSettings(for: key) {
+      return settings.timingBufferLevel
+        ?? SettingsModel.getInt(
+          from: SettingsModel.defaultTimingBufferLevel,
+          in: SettingsModel.timingBufferLevels)
+    }
+    return SettingsModel.getInt(
+      from: SettingsModel.defaultTimingBufferLevel,
+      in: SettingsModel.timingBufferLevels)
+  }
+
+  @objc static func timingPrioritizeResponsiveness(for key: String) -> Bool {
+    if let settings = Settings.getSettings(for: key) {
+      return settings.timingPrioritizeResponsiveness
+        ?? SettingsModel.defaultTimingPrioritizeResponsiveness
+    }
+    return SettingsModel.defaultTimingPrioritizeResponsiveness
+  }
+
+  @objc static func timingCompatibilityMode(for key: String) -> Bool {
+    if let settings = Settings.getSettings(for: key) {
+      return settings.timingCompatibilityMode ?? SettingsModel.defaultTimingCompatibilityMode
+    }
+    return SettingsModel.defaultTimingCompatibilityMode
+  }
+
+  @objc static func timingSdrCompatibilityWorkaround(for key: String) -> Bool {
+    if let settings = Settings.getSettings(for: key) {
+      return settings.timingSdrCompatibilityWorkaround
+        ?? SettingsModel.defaultTimingSdrCompatibilityWorkaround
+    }
+    return SettingsModel.defaultTimingSdrCompatibilityWorkaround
   }
 
   @objc static func showPerformanceOverlay(for key: String) -> Bool {
@@ -1140,6 +1241,20 @@ class SettingsClass: NSObject {
       return settings.showConnectionWarnings ?? SettingsModel.defaultShowConnectionWarnings
     }
     return SettingsModel.defaultShowConnectionWarnings
+  }
+
+  @objc static func awdlStabilityHelperEnabled() -> Bool {
+    if UserDefaults.standard.object(forKey: SettingsModel.awdlStabilityHelperEnabledKey) != nil {
+      return UserDefaults.standard.bool(forKey: SettingsModel.awdlStabilityHelperEnabledKey)
+    }
+    return SettingsModel.defaultAwdlStabilityHelperEnabled
+  }
+
+  @objc static func awdlStabilityHelperAcknowledged() -> Bool {
+    if UserDefaults.standard.object(forKey: SettingsModel.awdlStabilityHelperAcknowledgedKey) != nil {
+      return UserDefaults.standard.bool(forKey: SettingsModel.awdlStabilityHelperAcknowledgedKey)
+    }
+    return SettingsModel.defaultAwdlStabilityHelperAcknowledged
   }
 
   @objc static func captureSystemShortcuts(for key: String) -> Bool {

@@ -26,6 +26,8 @@ typedef enum {
 
 void Log(LogLevel level, NSString* fmt, ...);
 void LogTag(LogLevel level, NSString* tag, NSString* fmt, ...);
+void LogMessage(LogLevel level, NSString* message);
+void LogTaggedMessage(LogLevel level, NSString* tag, NSString* message);
 void LoggerSetMinimumLevel(LogLevel level);
 LogLevel LoggerGetMinimumLevel(void);
 void LoggerSetCuratedModeEnabled(BOOL enabled);

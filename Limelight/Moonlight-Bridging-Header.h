@@ -15,4 +15,5 @@
 #import "AppsWorkspaceViewController.h"
 #import "AppsViewController.h"
 #import "AppDelegateForAppKit.h"
+#import "AwdlAuthorizationHelper.h"
 #import "Logger.h"

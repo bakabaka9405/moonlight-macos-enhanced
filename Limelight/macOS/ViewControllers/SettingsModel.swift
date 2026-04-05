@@ -9,6 +9,7 @@
 import AppKit
 import CoreGraphics
 import SwiftUI
+import VideoToolbox
 
 struct Host: Identifiable, Hashable {
   let id: String
@@ -29,6 +30,8 @@ class SettingsModel: ObservableObject {
   static let debugLogShowSystemNoiseKey = "debugLog.showSystemNoise"
   static let debugLogAutoScrollKey = "debugLog.autoScroll"
   static let debugLogTimeScopeKey = "debugLog.timeScope"
+  static let awdlStabilityHelperEnabledKey = "networkCompatibility.awdlHelperEnabled"
+  static let awdlStabilityHelperAcknowledgedKey = "networkCompatibility.awdlHelperAcknowledged"
 
   private var latencyCache: [String: [String: Any]] = [:]
   private var selectedProfileObserver: NSObjectProtocol?
@@ -95,6 +98,18 @@ class SettingsModel: ObservableObject {
       UserDefaults.standard.set(debugLogTimeScope, forKey: Self.debugLogTimeScopeKey)
     }
   }
+  @Published var awdlStabilityHelperEnabled: Bool {
+    didSet {
+      UserDefaults.standard.set(
+        awdlStabilityHelperEnabled, forKey: Self.awdlStabilityHelperEnabledKey)
+    }
+  }
+  @Published var awdlStabilityHelperAcknowledged: Bool {
+    didSet {
+      UserDefaults.standard.set(
+        awdlStabilityHelperAcknowledged, forKey: Self.awdlStabilityHelperAcknowledgedKey)
+    }
+  }
 
   func selectHost(id: String?) {
     if let id {
@@ -110,6 +125,8 @@ class SettingsModel: ObservableObject {
 
   private var isLoading = false
   private var isAdjustingBitrate = false
+  private var isApplyingSmoothnessLatencyPreset = false
+  private var isSyncingSmoothnessLatencyMode = false
 
   var resolutionChangedCallback: (() -> Void)?
   var fpsChangedCallback: (() -> Void)?
@@ -324,7 +341,15 @@ class SettingsModel: ObservableObject {
   }
   @Published var selectedPacingOptions: String {
     didSet {
-      guard !isLoading else { return }
+      guard !isLoading, !isApplyingSmoothnessLatencyPreset else { return }
+      syncSmoothnessLatencyModeFromTimingDetails()
+      saveSettings()
+    }
+  }
+  @Published var selectedSmoothnessLatencyMode: String {
+    didSet {
+      guard !isLoading, !isSyncingSmoothnessLatencyMode else { return }
+      applySmoothnessLatencyPresetIfNeeded()
       saveSettings()
     }
   }
@@ -342,7 +367,56 @@ class SettingsModel: ObservableObject {
   }
   @Published var enableVsync: Bool {
     didSet {
-      guard !isLoading else { return }
+      guard !isLoading, !isApplyingSmoothnessLatencyPreset else { return }
+      if selectedSmoothnessLatencyMode == Self.smoothnessLatencyCustom {
+        saveSettings()
+        return
+      }
+      syncSmoothnessLatencyModeFromTimingDetails()
+      saveSettings()
+    }
+  }
+  @Published var selectedTimingBufferLevel: String {
+    didSet {
+      guard !isLoading, !isApplyingSmoothnessLatencyPreset else { return }
+      if selectedSmoothnessLatencyMode == Self.smoothnessLatencyCustom {
+        saveSettings()
+        return
+      }
+      syncSmoothnessLatencyModeFromTimingDetails()
+      saveSettings()
+    }
+  }
+  @Published var timingPrioritizeResponsiveness: Bool {
+    didSet {
+      guard !isLoading, !isApplyingSmoothnessLatencyPreset else { return }
+      if selectedSmoothnessLatencyMode == Self.smoothnessLatencyCustom {
+        saveSettings()
+        return
+      }
+      syncSmoothnessLatencyModeFromTimingDetails()
+      saveSettings()
+    }
+  }
+  @Published var timingCompatibilityMode: Bool {
+    didSet {
+      guard !isLoading, !isApplyingSmoothnessLatencyPreset else { return }
+      if selectedSmoothnessLatencyMode == Self.smoothnessLatencyCustom {
+        saveSettings()
+        return
+      }
+      syncSmoothnessLatencyModeFromTimingDetails()
+      saveSettings()
+    }
+  }
+  @Published var timingSdrCompatibilityWorkaround: Bool {
+    didSet {
+      guard !isLoading, !isApplyingSmoothnessLatencyPreset else { return }
+      if selectedSmoothnessLatencyMode == Self.smoothnessLatencyCustom {
+        saveSettings()
+        return
+      }
+      syncSmoothnessLatencyModeFromTimingDetails()
       saveSettings()
     }
   }
@@ -726,7 +800,7 @@ class SettingsModel: ObservableObject {
     // Extended steps up to 1000 Mbps (avoid too many slider ticks)
     return lockedBitrateSteps + [200, 250, 300, 350, 400, 500, 600, 800, 1000]
   }
-  static var videoCodecs: [String] = ["H.264", "H.265"]
+  static var videoCodecs: [String] = ["H.264", "H.265", "AV1"]
   static var pacingOptions: [String] = ["Lowest Latency", "Smoothest Video"]
   static var audioConfigurations: [String] = ["Stereo", "5.1 surround sound", "7.1 surround sound"]
   static var multiControllerModes: [String] = ["Single", "Auto"]
@@ -777,10 +851,33 @@ class SettingsModel: ObservableObject {
   }()
   static let defaultVideoCodec = "H.264"
   static let defaultHdr = false
+  static let smoothnessLatencyLow = "Low Latency"
+  static let smoothnessLatencyBalanced = "Balanced (Recommended)"
+  static let smoothnessLatencySmooth = "Smoothness First"
+  static let smoothnessLatencyCustom = "Custom"
+  static var smoothnessLatencyModes: [String] = [
+    smoothnessLatencyLow,
+    smoothnessLatencyBalanced,
+    smoothnessLatencySmooth,
+    smoothnessLatencyCustom,
+  ]
+  static let timingBufferLow = "Low"
+  static let timingBufferStandard = "Standard"
+  static let timingBufferHigh = "High"
+  static var timingBufferLevels: [String] = [
+    timingBufferLow,
+    timingBufferStandard,
+    timingBufferHigh,
+  ]
   static let defaultPacingOptions = "Smoothest Video"
+  static let defaultSmoothnessLatencyMode = smoothnessLatencyBalanced
+  static let defaultTimingBufferLevel = timingBufferStandard
+  static let defaultTimingPrioritizeResponsiveness = false
+  static let defaultTimingCompatibilityMode = false
+  static let defaultTimingSdrCompatibilityWorkaround = false
   static let defaultAudioOnPC = false
   static let defaultAudioConfiguration = "Stereo"
-  static let defaultEnableVsync = true
+  static let defaultEnableVsync = false
   static let defaultShowPerformanceOverlay = false
   static let defaultShowConnectionWarnings = true
   static let defaultCaptureSystemShortcuts = false
@@ -815,7 +912,7 @@ class SettingsModel: ObservableObject {
   static let defaultPointerSensitivity: CGFloat = 1.0
   static let defaultTouchscreenMode = 0  // Trackpad
   static let defaultGamepadMouseMode = false
-  static let defaultMouseMode = "game"
+  static let defaultMouseMode = "remote"
   static let defaultUpscalingMode = 0
   static let defaultDimNonHoveredArtwork = true
   static let defaultUnlockMaxBitrate = false
@@ -833,6 +930,8 @@ class SettingsModel: ObservableObject {
   static let defaultDebugLogShowSystemNoise = false
   static let defaultDebugLogAutoScroll = true
   static let defaultDebugLogTimeScope = "launch"
+  static let defaultAwdlStabilityHelperEnabled = false
+  static let defaultAwdlStabilityHelperAcknowledged = false
 
   private static func mainDisplayPixelSize() -> CGSize? {
     guard let screen = NSScreen.main,
@@ -950,6 +1049,111 @@ class SettingsModel: ObservableObject {
     isAdjustingBitrate = false
   }
 
+  private static func derivedSmoothnessLatencyMode(
+    framePacing: Int,
+    enableVsync: Bool?,
+    timingBufferLevel: Int?,
+    timingPrioritizeResponsiveness: Bool?,
+    timingCompatibilityMode: Bool?,
+    timingSdrCompatibilityWorkaround: Bool?
+  ) -> Int {
+    let pacing = getString(from: framePacing, in: pacingOptions)
+    let vsyncEnabled = enableVsync ?? defaultEnableVsync
+    let bufferLevel = getString(
+      from: timingBufferLevel ?? getInt(from: defaultTimingBufferLevel, in: timingBufferLevels),
+      in: timingBufferLevels)
+    let prioritizeResponsiveness =
+      timingPrioritizeResponsiveness ?? defaultTimingPrioritizeResponsiveness
+    let compatibilityMode = timingCompatibilityMode ?? defaultTimingCompatibilityMode
+    let sdrCompatibilityWorkaround =
+      timingSdrCompatibilityWorkaround ?? defaultTimingSdrCompatibilityWorkaround
+
+    if pacing == pacingOptions.first,
+      !vsyncEnabled,
+      bufferLevel == timingBufferLow,
+      prioritizeResponsiveness,
+      !compatibilityMode,
+      !sdrCompatibilityWorkaround
+    {
+      return getInt(from: smoothnessLatencyLow, in: smoothnessLatencyModes)
+    }
+
+    if pacing == defaultPacingOptions,
+      !vsyncEnabled,
+      bufferLevel == timingBufferStandard,
+      !prioritizeResponsiveness,
+      !compatibilityMode,
+      !sdrCompatibilityWorkaround
+    {
+      return getInt(from: smoothnessLatencyBalanced, in: smoothnessLatencyModes)
+    }
+
+    if pacing == defaultPacingOptions,
+      vsyncEnabled,
+      bufferLevel == timingBufferHigh,
+      !prioritizeResponsiveness,
+      !compatibilityMode,
+      !sdrCompatibilityWorkaround
+    {
+      return getInt(from: smoothnessLatencySmooth, in: smoothnessLatencyModes)
+    }
+
+    return getInt(from: smoothnessLatencyCustom, in: smoothnessLatencyModes)
+  }
+
+  private func syncSmoothnessLatencyModeFromTimingDetails() {
+    let derivedMode = Self.getString(
+      from: Self.derivedSmoothnessLatencyMode(
+        framePacing: Self.getInt(from: selectedPacingOptions, in: Self.pacingOptions),
+        enableVsync: enableVsync,
+        timingBufferLevel: Self.getInt(from: selectedTimingBufferLevel, in: Self.timingBufferLevels),
+        timingPrioritizeResponsiveness: timingPrioritizeResponsiveness,
+        timingCompatibilityMode: timingCompatibilityMode,
+        timingSdrCompatibilityWorkaround: timingSdrCompatibilityWorkaround
+      ),
+      in: Self.smoothnessLatencyModes
+    )
+
+    guard selectedSmoothnessLatencyMode != derivedMode else { return }
+
+    isSyncingSmoothnessLatencyMode = true
+    selectedSmoothnessLatencyMode = derivedMode
+    isSyncingSmoothnessLatencyMode = false
+  }
+
+  private func applySmoothnessLatencyPresetIfNeeded() {
+    guard selectedSmoothnessLatencyMode != Self.smoothnessLatencyCustom else { return }
+
+    isApplyingSmoothnessLatencyPreset = true
+    defer { isApplyingSmoothnessLatencyPreset = false }
+
+    switch selectedSmoothnessLatencyMode {
+    case Self.smoothnessLatencyLow:
+      selectedPacingOptions = Self.pacingOptions.first ?? Self.defaultPacingOptions
+      enableVsync = false
+      selectedTimingBufferLevel = Self.timingBufferLow
+      timingPrioritizeResponsiveness = true
+      timingCompatibilityMode = false
+      timingSdrCompatibilityWorkaround = false
+    case Self.smoothnessLatencyBalanced:
+      selectedPacingOptions = Self.defaultPacingOptions
+      enableVsync = false
+      selectedTimingBufferLevel = Self.timingBufferStandard
+      timingPrioritizeResponsiveness = false
+      timingCompatibilityMode = false
+      timingSdrCompatibilityWorkaround = false
+    case Self.smoothnessLatencySmooth:
+      selectedPacingOptions = Self.defaultPacingOptions
+      enableVsync = true
+      selectedTimingBufferLevel = Self.timingBufferHigh
+      timingPrioritizeResponsiveness = false
+      timingCompatibilityMode = false
+      timingSdrCompatibilityWorkaround = false
+    default:
+      break
+    }
+  }
+
   private static func normalizedDebugLogMode(_ value: String?) -> String {
     guard let value else { return defaultDebugLogMode }
     let normalized = value.lowercased()
@@ -1020,6 +1224,18 @@ class SettingsModel: ObservableObject {
     }
     debugLogTimeScope = Self.normalizedDebugLogTimeScope(
       UserDefaults.standard.string(forKey: Self.debugLogTimeScopeKey))
+    if UserDefaults.standard.object(forKey: Self.awdlStabilityHelperEnabledKey) != nil {
+      awdlStabilityHelperEnabled = UserDefaults.standard.bool(
+        forKey: Self.awdlStabilityHelperEnabledKey)
+    } else {
+      awdlStabilityHelperEnabled = Self.defaultAwdlStabilityHelperEnabled
+    }
+    if UserDefaults.standard.object(forKey: Self.awdlStabilityHelperAcknowledgedKey) != nil {
+      awdlStabilityHelperAcknowledged = UserDefaults.standard.bool(
+        forKey: Self.awdlStabilityHelperAcknowledgedKey)
+    } else {
+      awdlStabilityHelperAcknowledged = Self.defaultAwdlStabilityHelperAcknowledged
+    }
 
     selectedResolution = Self.defaultResolution
     customResWidth = Self.defaultCustomResWidth
@@ -1052,10 +1268,15 @@ class SettingsModel: ObservableObject {
     selectedVideoCodec = Self.defaultVideoCodec
     hdr = Self.defaultHdr
     selectedPacingOptions = Self.defaultPacingOptions
+    selectedSmoothnessLatencyMode = Self.defaultSmoothnessLatencyMode
 
     audioOnPC = Self.defaultAudioOnPC
     selectedAudioConfiguration = Self.defaultAudioConfiguration
     enableVsync = Self.defaultEnableVsync
+    selectedTimingBufferLevel = Self.defaultTimingBufferLevel
+    timingPrioritizeResponsiveness = Self.defaultTimingPrioritizeResponsiveness
+    timingCompatibilityMode = Self.defaultTimingCompatibilityMode
+    timingSdrCompatibilityWorkaround = Self.defaultTimingSdrCompatibilityWorkaround
     showPerformanceOverlay = Self.defaultShowPerformanceOverlay
     showConnectionWarnings = Self.defaultShowConnectionWarnings
     captureSystemShortcuts = Self.defaultCaptureSystemShortcuts
@@ -1198,10 +1419,15 @@ class SettingsModel: ObservableObject {
     selectedVideoCodec = Self.defaultVideoCodec
     hdr = Self.defaultHdr
     selectedPacingOptions = Self.defaultPacingOptions
+    selectedSmoothnessLatencyMode = Self.defaultSmoothnessLatencyMode
 
     audioOnPC = Self.defaultAudioOnPC
     selectedAudioConfiguration = Self.defaultAudioConfiguration
     enableVsync = Self.defaultEnableVsync
+    selectedTimingBufferLevel = Self.defaultTimingBufferLevel
+    timingPrioritizeResponsiveness = Self.defaultTimingPrioritizeResponsiveness
+    timingCompatibilityMode = Self.defaultTimingCompatibilityMode
+    timingSdrCompatibilityWorkaround = Self.defaultTimingSdrCompatibilityWorkaround
     showPerformanceOverlay = Self.defaultShowPerformanceOverlay
     showConnectionWarnings = Self.defaultShowConnectionWarnings
     captureSystemShortcuts = Self.defaultCaptureSystemShortcuts
@@ -1300,11 +1526,31 @@ class SettingsModel: ObservableObject {
       selectedVideoCodec = Self.getString(from: settings.codec, in: Self.videoCodecs)
       hdr = settings.hdr
       selectedPacingOptions = Self.getString(from: settings.framePacing, in: Self.pacingOptions)
+      selectedSmoothnessLatencyMode = Self.getString(
+        from: settings.smoothnessLatencyMode
+          ?? Self.derivedSmoothnessLatencyMode(
+            framePacing: settings.framePacing,
+            enableVsync: settings.enableVsync,
+            timingBufferLevel: settings.timingBufferLevel,
+            timingPrioritizeResponsiveness: settings.timingPrioritizeResponsiveness,
+            timingCompatibilityMode: settings.timingCompatibilityMode,
+            timingSdrCompatibilityWorkaround: settings.timingSdrCompatibilityWorkaround
+          ),
+        in: Self.smoothnessLatencyModes)
 
       audioOnPC = settings.audioOnPC
       selectedAudioConfiguration = Self.getString(
         from: settings.audioConfiguration, in: Self.audioConfigurations)
       enableVsync = settings.enableVsync ?? SettingsModel.defaultEnableVsync
+      selectedTimingBufferLevel = Self.getString(
+        from: settings.timingBufferLevel ?? Self.getInt(from: Self.defaultTimingBufferLevel, in: Self.timingBufferLevels),
+        in: Self.timingBufferLevels)
+      timingPrioritizeResponsiveness =
+        settings.timingPrioritizeResponsiveness ?? Self.defaultTimingPrioritizeResponsiveness
+      timingCompatibilityMode =
+        settings.timingCompatibilityMode ?? Self.defaultTimingCompatibilityMode
+      timingSdrCompatibilityWorkaround =
+        settings.timingSdrCompatibilityWorkaround ?? Self.defaultTimingSdrCompatibilityWorkaround
       showPerformanceOverlay =
         settings.showPerformanceOverlay ?? SettingsModel.defaultShowPerformanceOverlay
       showConnectionWarnings =
@@ -1488,6 +1734,10 @@ class SettingsModel: ObservableObject {
     }
     let codec = Self.getInt(from: selectedVideoCodec, in: Self.videoCodecs)
     let framePacing = Self.getInt(from: selectedPacingOptions, in: Self.pacingOptions)
+    let smoothnessLatencyMode = Self.getInt(
+      from: selectedSmoothnessLatencyMode, in: Self.smoothnessLatencyModes)
+    let timingBufferLevel = Self.getInt(
+      from: selectedTimingBufferLevel, in: Self.timingBufferLevels)
     let audioConfig = Self.getInt(from: selectedAudioConfiguration, in: Self.audioConfigurations)
     let multiController = Self.getBool(
       from: selectedMultiControllerMode, in: Self.multiControllerModes)
@@ -1559,7 +1809,12 @@ class SettingsModel: ObservableObject {
       pointerSensitivity: pointerSensitivity,
       streamShortcuts: StreamShortcutProfile.normalizedShortcuts(streamShortcuts),
       upscalingMode: upscalingMode,
-      connectionMethod: selectedConnectionMethod
+      connectionMethod: selectedConnectionMethod,
+      smoothnessLatencyMode: smoothnessLatencyMode,
+      timingBufferLevel: timingBufferLevel,
+      timingPrioritizeResponsiveness: timingPrioritizeResponsiveness,
+      timingCompatibilityMode: timingCompatibilityMode,
+      timingSdrCompatibilityWorkaround: timingSdrCompatibilityWorkaround
     )
 
     if let data = try? PropertyListEncoder().encode(settings) {
@@ -1640,6 +1895,10 @@ class SettingsModel: ObservableObject {
     }
 
     return settingString
+  }
+
+  static var av1HardwareDecodeSupported: Bool {
+    VTIsHardwareDecodeSupported(kCMVideoCodecType_AV1)
   }
 }
 

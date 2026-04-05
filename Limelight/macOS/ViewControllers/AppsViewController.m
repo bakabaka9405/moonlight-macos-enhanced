@@ -70,6 +70,50 @@ const CGFloat scaleBase = 1.125;
 
 #pragma mark - Lifecycle
 
+- (void)loadView {
+    @try {
+        [super loadView];
+    } @catch (NSException *exception) {
+        Log(LOG_W, @"[diag] AppsViewController storyboard view load failed: %@. Falling back to programmatic view.", exception.reason ?: @"(unknown)");
+
+        NSView *rootView = [[NSView alloc] initWithFrame:NSMakeRect(0, 0, 450, 300)];
+        rootView.autoresizingMask = NSViewWidthSizable | NSViewHeightSizable;
+
+        NSScrollView *scrollView = [[NSScrollView alloc] initWithFrame:NSZeroRect];
+        scrollView.translatesAutoresizingMaskIntoConstraints = NO;
+        scrollView.borderType = NSNoBorder;
+        scrollView.hasVerticalScroller = YES;
+        scrollView.hasHorizontalScroller = NO;
+        scrollView.autohidesScrollers = YES;
+        scrollView.drawsBackground = YES;
+        scrollView.backgroundColor = [NSColor controlBackgroundColor];
+
+        CollectionView *collectionView = [[CollectionView alloc] initWithFrame:NSMakeRect(0, 0, 450, 300)];
+        collectionView.selectable = YES;
+        collectionView.autoresizingMask = NSViewWidthSizable;
+
+        NSCollectionViewFlowLayout *layout = [[NSCollectionViewFlowLayout alloc] init];
+        layout.minimumInteritemSpacing = 10.0;
+        layout.minimumLineSpacing = 24.0;
+        layout.itemSize = NSMakeSize(96.0, 144.0);
+        layout.sectionInset = NSEdgeInsetsMake(28.0, 16.0, 28.0, 16.0);
+        collectionView.collectionViewLayout = layout;
+        collectionView.backgroundColors = @[[NSColor controlBackgroundColor]];
+
+        scrollView.documentView = collectionView;
+        [rootView addSubview:scrollView];
+        [NSLayoutConstraint activateConstraints:@[
+            [scrollView.leadingAnchor constraintEqualToAnchor:rootView.leadingAnchor],
+            [scrollView.trailingAnchor constraintEqualToAnchor:rootView.trailingAnchor],
+            [scrollView.topAnchor constraintEqualToAnchor:rootView.topAnchor],
+            [scrollView.bottomAnchor constraintEqualToAnchor:rootView.bottomAnchor],
+        ]];
+
+        self.collectionView = collectionView;
+        self.view = rootView;
+    }
+}
+
 - (void)viewDidLoad {
     [super viewDidLoad];
     

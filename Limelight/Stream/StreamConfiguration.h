@@ -29,9 +29,16 @@
 @property(nonatomic) int audioConfiguration;
 @property(nonatomic) BOOL enableHdr;
 @property(nonatomic) BOOL enableVsync;
+@property(nonatomic) int framePacingMode;
+@property(nonatomic) int smoothnessLatencyMode;
+@property(nonatomic) int timingBufferLevel;
+@property(nonatomic) BOOL timingPrioritizeResponsiveness;
+@property(nonatomic) BOOL timingCompatibilityMode;
+@property(nonatomic) BOOL timingSdrCompatibilityWorkaround;
 @property(nonatomic) BOOL showPerformanceOverlay;
 @property(nonatomic) BOOL multiController;
 @property(nonatomic) BOOL allowHevc;
+@property(nonatomic) int videoCodecPreference;
 @property(nonatomic, copy) NSData *serverCert;
 @property(nonatomic) int serverCodecModeSupport;
 @property(nonatomic, copy) NSString *sessionUrl;

@@ -57,7 +57,8 @@ typedef struct {
 
 - (void)setupWithVideoFormat:(int)videoFormat
                    frameRate:(int)frameRate
-               upscalingMode:(int)upscalingMode;
+               upscalingMode:(int)upscalingMode
+                streamConfig:(StreamConfiguration *)streamConfig;
 - (void)start;
 - (void)stop;
 

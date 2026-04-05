@@ -13,6 +13,11 @@
 #include "Limelight.h"
 #include <math.h>
 #include <pthread.h>
+#include <libavcodec/avcodec.h>
+#include <libavcodec/cbs.h>
+#include <libavcodec/cbs_av1.h>
+#include <libavformat/avio.h>
+#include <libavutil/mem.h>
 #import "Moonlight-Swift.h"
 
 @import VideoToolbox;
@@ -26,6 +31,9 @@
 @protocol MTLFXSpatialScaler;
 @end
 #endif
+
+extern int ff_isom_write_av1c(AVIOContext *pb, const uint8_t *buf, int size,
+                              int write_seq_header);
 
 @interface VideoDecoderRenderer () <MTKViewDelegate>
 @property (nonatomic) int frameRate;
@@ -93,6 +101,17 @@ static BOOL MLMetalFXIsSupported(void)
     return NO;
 }
 
+static int MLClampInt(int value, int minValue, int maxValue)
+{
+    if (value < minValue) {
+        return minValue;
+    }
+    if (value > maxValue) {
+        return maxValue;
+    }
+    return value;
+}
+
 static NSString *const kMetalShaderSource = @"#include <metal_stdlib>\n"
 "using namespace metal;\n"
 "kernel void ycbcrToRgb(texture2d<float, access::read> textureY [[texture(0)]],\n"
@@ -158,6 +177,14 @@ static NSString *const kMetalShaderSource = @"#include <metal_stdlib>\n"
     uint64_t _lastDequeuedFrameMs;
     uint64_t _lastIdleLogMs;
     NSUInteger _remainingDequeuedFrameLogCount;
+    NSInteger _framePacingMode;
+    NSInteger _smoothnessLatencyMode;
+    NSInteger _timingBufferLevel;
+    BOOL _timingEnableVsync;
+    BOOL _timingPrioritizeResponsiveness;
+    BOOL _timingCompatibilityMode;
+    BOOL _timingSdrCompatibilityWorkaround;
+    NSInteger _lastLoggedPendingTarget;
 }
 
 @synthesize videoFormat;
@@ -209,10 +236,21 @@ static CGDirectDisplayID getDisplayID(NSScreen* screen)
     return self;
 }
 
-- (void)setupWithVideoFormat:(int)videoFormat frameRate:(int)frameRate upscalingMode:(int)upscalingMode
+- (void)setupWithVideoFormat:(int)videoFormat
+                   frameRate:(int)frameRate
+               upscalingMode:(int)upscalingMode
+                streamConfig:(StreamConfiguration *)streamConfig
 {
     self->videoFormat = videoFormat;
     self.frameRate = frameRate;
+    _framePacingMode = streamConfig ? streamConfig.framePacingMode : 1;
+    _smoothnessLatencyMode = streamConfig ? streamConfig.smoothnessLatencyMode : 1;
+    _timingBufferLevel = streamConfig ? streamConfig.timingBufferLevel : 1;
+    _timingEnableVsync = streamConfig ? streamConfig.enableVsync : NO;
+    _timingPrioritizeResponsiveness = streamConfig ? streamConfig.timingPrioritizeResponsiveness : NO;
+    _timingCompatibilityMode = streamConfig ? streamConfig.timingCompatibilityMode : NO;
+    _timingSdrCompatibilityWorkaround = streamConfig ? streamConfig.timingSdrCompatibilityWorkaround : NO;
+    _lastLoggedPendingTarget = NSIntegerMin;
 
     // MetalFX is macOS 13+. If user selected it on a newer OS but runs on an older
     // deployment target at runtime, force fallback to legacy rendering.
@@ -253,6 +291,55 @@ static CGDirectDisplayID getDisplayID(NSScreen* screen)
             }
         }
     });
+}
+
+- (int)desiredPendingFramesForDisplayRefreshRate:(double)displayRefreshRate
+{
+    int target = 1;
+    switch (_timingBufferLevel) {
+        case 0:
+            target = 0;
+            break;
+        case 2:
+            target = 2;
+            break;
+        default:
+            target = 1;
+            break;
+    }
+
+    if (_framePacingMode == 0) {
+        target = MIN(target, 1);
+        if (_smoothnessLatencyMode == 0) {
+            target = 0;
+        }
+    }
+
+    if (_timingPrioritizeResponsiveness) {
+        target -= 1;
+    }
+
+    if (_timingEnableVsync) {
+        target = MAX(target, 1);
+    }
+
+    if (_timingCompatibilityMode) {
+        target = MAX(target, 1);
+    }
+
+    if (_timingSdrCompatibilityWorkaround && !(videoFormat & VIDEO_FORMAT_MASK_10BIT)) {
+        target += 1;
+    }
+
+    if (displayRefreshRate > 0 && displayRefreshRate < (double)self.frameRate * 0.90) {
+        if (_timingCompatibilityMode || _timingEnableVsync) {
+            target = MAX(target, 1);
+        } else {
+            target -= 1;
+        }
+    }
+
+    return MLClampInt(target, 0, 3);
 }
 
 - (void)setupMetalRenderer {
@@ -587,6 +674,28 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
     VIDEO_FRAME_HANDLE handle;
     PDECODE_UNIT du;
     BOOL dequeuedAny = NO;
+    double displayRefreshRate = 0.0;
+    if (self->_displayLink != NULL) {
+        double refreshPeriod = CVDisplayLinkGetActualOutputVideoRefreshPeriod(self->_displayLink);
+        if (refreshPeriod > 0.0) {
+            displayRefreshRate = 1.0 / refreshPeriod;
+        }
+    }
+    int desiredPendingFrames = [self desiredPendingFramesForDisplayRefreshRate:displayRefreshRate];
+    if (self->_lastLoggedPendingTarget != desiredPendingFrames) {
+        self->_lastLoggedPendingTarget = desiredPendingFrames;
+        Log(LOG_I, @"[diag] Renderer pacing target updated: pending=%d framePacing=%ld mode=%ld buffer=%ld responsiveness=%d compatibility=%d vsync=%d sdrCompat=%d display=%.2fHz stream=%d",
+            desiredPendingFrames,
+            (long)self->_framePacingMode,
+            (long)self->_smoothnessLatencyMode,
+            (long)self->_timingBufferLevel,
+            self->_timingPrioritizeResponsiveness ? 1 : 0,
+            self->_timingCompatibilityMode ? 1 : 0,
+            self->_timingEnableVsync ? 1 : 0,
+            self->_timingSdrCompatibilityWorkaround ? 1 : 0,
+            displayRefreshRate,
+            self.frameRate);
+    }
     
     while (LiPollNextVideoFrameCtx(depacketizerCtx, &handle, &du)) {
         dequeuedAny = YES;
@@ -695,18 +804,9 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         snapshotStats.lastUpdatedTimestamp = LiGetMillis();
         self->_videoStats = snapshotStats;
         
-        // Calculate the actual display refresh rate
-        double displayRefreshRate = 1 / CVDisplayLinkGetActualOutputVideoRefreshPeriod(self->_displayLink);
-        
-        // Only pace frames if the display refresh rate is >= 90% of our stream frame rate.
-        // Battery saver, accessibility settings, or device thermals can cause the actual
-        // refresh rate of the display to drop below the physical maximum.
-        if (displayRefreshRate >= self.frameRate * 0.9f) {
-            // Keep one pending frame to smooth out gaps due to
-            // network jitter at the cost of 1 frame of latency
-            if (LiGetPendingVideoFramesCtx(depacketizerCtx) == 1) {
-                break;
-            }
+        int pendingFrames = LiGetPendingVideoFramesCtx(depacketizerCtx);
+        if (pendingFrames <= desiredPendingFrames) {
+            break;
         }
     }
 
@@ -754,6 +854,9 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
 
 - (Boolean)readyForPictureData
 {
+    if (videoFormat & VIDEO_FORMAT_MASK_AV1) {
+        return true;
+    }
     if (videoFormat & VIDEO_FORMAT_MASK_H264) {
         return !waitingForSps && !waitingForPps;
     }
@@ -761,6 +864,182 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         // H.265 requires VPS in addition to SPS and PPS
         return !waitingForVps && !waitingForSps && !waitingForPps;
     }
+}
+
+- (NSData *)av1CodecConfigurationBoxForFrame:(NSData *)frameData
+{
+    AVIOContext *ioctx = NULL;
+    int err = avio_open_dyn_buf(&ioctx);
+    if (err < 0) {
+        Log(LOG_E, @"avio_open_dyn_buf() failed: %d", err);
+        return nil;
+    }
+
+    err = ff_isom_write_av1c(ioctx, (uint8_t *)frameData.bytes, (int)frameData.length, 1);
+    if (err < 0) {
+        Log(LOG_E, @"ff_isom_write_av1c() failed: %d", err);
+    }
+
+    uint8_t *av1cBuf = NULL;
+    int av1cBufLen = avio_close_dyn_buf(ioctx, &av1cBuf);
+    NSData *data = nil;
+    if (err >= 0 && av1cBufLen > 0) {
+        data = [NSData dataWithBytes:av1cBuf length:av1cBufLen];
+    }
+
+    av_free(av1cBuf);
+    return data;
+}
+
+- (CMVideoFormatDescriptionRef)createAV1FormatDescriptionForIDRFrame:(NSData *)frameData
+{
+    NSMutableDictionary *extensions = [[NSMutableDictionary alloc] init];
+
+    CodedBitstreamContext *cbsCtx = NULL;
+    int err = ff_cbs_init(&cbsCtx, AV_CODEC_ID_AV1, NULL);
+    if (err < 0) {
+        Log(LOG_E, @"ff_cbs_init() failed: %d", err);
+        return nil;
+    }
+
+    AVPacket avPacket = {};
+    avPacket.data = (uint8_t *)frameData.bytes;
+    avPacket.size = (int)frameData.length;
+
+    CodedBitstreamFragment cbsFrag = {};
+    err = ff_cbs_read_packet(cbsCtx, &cbsFrag, &avPacket);
+    if (err < 0) {
+        Log(LOG_E, @"ff_cbs_read_packet() failed: %d", err);
+        ff_cbs_close(&cbsCtx);
+        return nil;
+    }
+
+#define SET_CFSTR_EXTENSION(key, value) extensions[(__bridge NSString*)key] = (__bridge NSString*)(value)
+#define SET_EXTENSION(key, value) extensions[(__bridge NSString*)key] = (value)
+
+    SET_EXTENSION(kCMFormatDescriptionExtension_FormatName, @"av01");
+    SET_EXTENSION(kCMFormatDescriptionExtension_Depth, @24);
+
+    CodedBitstreamAV1Context *bitstreamCtx = (CodedBitstreamAV1Context *)cbsCtx->priv_data;
+    AV1RawSequenceHeader *seqHeader = bitstreamCtx->sequence_header;
+    if (seqHeader == NULL) {
+        Log(LOG_E, @"AV1 sequence header not found in IDR frame");
+        ff_cbs_fragment_free(&cbsFrag);
+        ff_cbs_close(&cbsCtx);
+        return nil;
+    }
+
+    switch (seqHeader->color_config.color_primaries) {
+        case 1:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_ColorPrimaries,
+                                kCMFormatDescriptionColorPrimaries_ITU_R_709_2);
+            break;
+        case 6:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_ColorPrimaries,
+                                kCMFormatDescriptionColorPrimaries_SMPTE_C);
+            break;
+        case 9:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_ColorPrimaries,
+                                kCMFormatDescriptionColorPrimaries_ITU_R_2020);
+            break;
+        default:
+            break;
+    }
+
+    switch (seqHeader->color_config.transfer_characteristics) {
+        case 1:
+        case 6:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_TransferFunction,
+                                kCMFormatDescriptionTransferFunction_ITU_R_709_2);
+            break;
+        case 7:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_TransferFunction,
+                                kCMFormatDescriptionTransferFunction_SMPTE_240M_1995);
+            break;
+        case 8:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_TransferFunction,
+                                kCMFormatDescriptionTransferFunction_Linear);
+            break;
+        case 14:
+        case 15:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_TransferFunction,
+                                kCMFormatDescriptionTransferFunction_ITU_R_2020);
+            break;
+        case 16:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_TransferFunction,
+                                kCMFormatDescriptionTransferFunction_SMPTE_ST_2084_PQ);
+            break;
+        case 17:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_TransferFunction,
+                                kCMFormatDescriptionTransferFunction_ITU_R_2100_HLG);
+            break;
+        default:
+            break;
+    }
+
+    switch (seqHeader->color_config.matrix_coefficients) {
+        case 1:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_YCbCrMatrix,
+                                kCMFormatDescriptionYCbCrMatrix_ITU_R_709_2);
+            break;
+        case 6:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_YCbCrMatrix,
+                                kCMFormatDescriptionYCbCrMatrix_ITU_R_601_4);
+            break;
+        case 7:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_YCbCrMatrix,
+                                kCMFormatDescriptionYCbCrMatrix_SMPTE_240M_1995);
+            break;
+        case 9:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_YCbCrMatrix,
+                                kCMFormatDescriptionYCbCrMatrix_ITU_R_2020);
+            break;
+        default:
+            break;
+    }
+
+    SET_EXTENSION(kCMFormatDescriptionExtension_FullRangeVideo, @(seqHeader->color_config.color_range == 1));
+    SET_EXTENSION(kCMFormatDescriptionExtension_FieldCount, @(1));
+
+    switch (seqHeader->color_config.chroma_sample_position) {
+        case 1:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_ChromaLocationTopField,
+                                kCMFormatDescriptionChromaLocation_Left);
+            break;
+        case 2:
+            SET_CFSTR_EXTENSION(kCMFormatDescriptionExtension_ChromaLocationTopField,
+                                kCMFormatDescriptionChromaLocation_TopLeft);
+            break;
+        default:
+            break;
+    }
+
+    NSData *av1Config = [self av1CodecConfigurationBoxForFrame:frameData];
+    if (av1Config != nil) {
+        extensions[(__bridge NSString *)kCMFormatDescriptionExtension_SampleDescriptionExtensionAtoms] = @{
+            @"av1C": av1Config,
+        };
+    }
+    extensions[@"BitsPerComponent"] = @(bitstreamCtx->bit_depth);
+
+    CMVideoFormatDescriptionRef av1FormatDesc = NULL;
+    OSStatus status = CMVideoFormatDescriptionCreate(kCFAllocatorDefault,
+                                                     kCMVideoCodecType_AV1,
+                                                     bitstreamCtx->frame_width,
+                                                     bitstreamCtx->frame_height,
+                                                     (__bridge CFDictionaryRef)extensions,
+                                                     &av1FormatDesc);
+    if (status != noErr) {
+        Log(LOG_E, @"Failed to create AV1 format description: %d", (int)status);
+        av1FormatDesc = NULL;
+    }
+
+#undef SET_EXTENSION
+#undef SET_CFSTR_EXTENSION
+
+    ff_cbs_fragment_free(&cbsFrag);
+    ff_cbs_close(&cbsCtx);
+    return av1FormatDesc;
 }
 
 - (void)updateBufferForRange:(CMBlockBufferRef)frameBuffer dataBlock:(CMBlockBufferRef)dataBuffer offset:(int)offset length:(int)nalLength
@@ -930,6 +1209,21 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         return DR_OK;
     }
     
+    if ((videoFormat & VIDEO_FORMAT_MASK_AV1) && frameType != FRAME_TYPE_PFRAME) {
+        if (formatDesc != nil) {
+            CFRelease(formatDesc);
+            formatDesc = nil;
+        }
+
+        NSData *fullFrameData = [NSData dataWithBytesNoCopy:data length:length freeWhenDone:NO];
+        Log(LOG_I, @"Constructing new AV1 format description");
+        formatDesc = [self createAV1FormatDescriptionForIDRFrame:fullFrameData];
+
+        if (_upscalingMode > 0 && formatDesc != NULL) {
+            [self createDecompressionSession];
+        }
+    }
+
     if (formatDesc == NULL) {
         // Can't decode if we haven't gotten our parameter sets yet
         free(data);
@@ -980,23 +1274,33 @@ static CVReturn displayLinkCallback(CVDisplayLinkRef displayLink,
         return DR_NEED_IDR;
     }
     
-    int lastOffset = -1;
-    for (int i = 0; i < length - FRAME_START_PREFIX_SIZE; i++) {
-        // Search for a NALU
-        if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
-            // It's the start of a new NALU
-            if (lastOffset != -1) {
-                // We've seen a start before this so enqueue that NALU
-                [self updateBufferForRange:frameBlockBuffer dataBlock:dataBlockBuffer offset:lastOffset length:i - lastOffset];
+    if (videoFormat & (VIDEO_FORMAT_MASK_H264 | VIDEO_FORMAT_MASK_H265)) {
+        int lastOffset = -1;
+        for (int i = 0; i < length - FRAME_START_PREFIX_SIZE; i++) {
+            // Search for a NALU
+            if (data[i] == 0 && data[i+1] == 0 && data[i+2] == 1) {
+                // It's the start of a new NALU
+                if (lastOffset != -1) {
+                    // We've seen a start before this so enqueue that NALU
+                    [self updateBufferForRange:frameBlockBuffer dataBlock:dataBlockBuffer offset:lastOffset length:i - lastOffset];
+                }
+                
+                lastOffset = i;
             }
-            
-            lastOffset = i;
         }
-    }
-    
-    if (lastOffset != -1) {
-        // Enqueue the remaining data
-        [self updateBufferForRange:frameBlockBuffer dataBlock:dataBlockBuffer offset:lastOffset length:length - lastOffset];
+        
+        if (lastOffset != -1) {
+            // Enqueue the remaining data
+            [self updateBufferForRange:frameBlockBuffer dataBlock:dataBlockBuffer offset:lastOffset length:length - lastOffset];
+        }
+    } else {
+        status = CMBlockBufferAppendBufferReference(frameBlockBuffer, dataBlockBuffer, 0, length, 0);
+        if (status != noErr) {
+            Log(LOG_E, @"CMBlockBufferAppendBufferReference failed: %d", (int)status);
+            CFRelease(dataBlockBuffer);
+            CFRelease(frameBlockBuffer);
+            return DR_NEED_IDR;
+        }
     }
     
     // From now on, CMBlockBuffer owns the data pointer and will free it when it's dereferenced

@@ -86,6 +86,7 @@
 				macOS/AppDelegateForAppKit.m,
 				macOS/Assets.xcassets,
 				macOS/Helpers/AlertPresenter.m,
+				macOS/Helpers/AwdlAuthorizationHelper.m,
 				macOS/Helpers/BackgroundColorView.m,
 				macOS/Helpers/ControllerNavigation.m,
 				macOS/Helpers/Functional/F.m,
@@ -236,6 +237,7 @@
 				4C7E0A761FECBFFD00684411 /* Sources */,
 				4C7E0A771FECBFFD00684411 /* Frameworks */,
 				4C7E0A781FECBFFD00684411 /* Resources */,
+				A4C4E0012E8A100000A1B001 /* Build AWDL Privileged Helper */,
 				A428584B2D50682400E39078 /* Embed Frameworks */,
 			);
 			buildRules = (
@@ -265,7 +267,7 @@
 						ProvisioningStyle = Automatic;
 						SystemCapabilities = {
 							com.apple.Sandbox = {
-								enabled = 1;
+								enabled = 0;
 							};
 						};
 					};
@@ -319,6 +321,31 @@
 			runOnlyForDeploymentPostprocessing = 0;
 		};
 /* End PBXResourcesBuildPhase section */
+
+/* Begin PBXShellScriptBuildPhase section */
+		A4C4E0012E8A100000A1B001 /* Build AWDL Privileged Helper */ = {
+			isa = PBXShellScriptBuildPhase;
+			buildActionMask = 2147483647;
+			files = (
+			);
+			inputFileListPaths = (
+			);
+			inputPaths = (
+				"$(SRCROOT)/Limelight/macOS/Helpers/AwdlPrivilegedHelperMain.m",
+				"$(SRCROOT)/Limelight/macOS/Helpers/AwdlPrivilegedHelperProtocol.h",
+				"$(SRCROOT)/scripts/build_awdl_privileged_helper.sh",
+			);
+			name = "Build AWDL Privileged Helper";
+			outputFileListPaths = (
+			);
+			outputPaths = (
+				"$(TARGET_BUILD_DIR)/$(CONTENTS_FOLDER_PATH)/Library/LaunchServices/$(PRODUCT_BUNDLE_IDENTIFIER).AwdlPrivilegedHelper",
+			);
+			runOnlyForDeploymentPostprocessing = 0;
+			shellPath = /bin/zsh;
+			shellScript = "\"${SRCROOT}/scripts/build_awdl_privileged_helper.sh\"\n";
+		};
+/* End PBXShellScriptBuildPhase section */
 
 /* Begin PBXSourcesBuildPhase section */
 		4C7E0A761FECBFFD00684411 /* Sources */ = {
@@ -377,12 +404,12 @@
 				COMBINE_HIDPI_IMAGES = YES;
 				DEAD_CODE_STRIPPING = YES;
 				DEBUG_INFORMATION_FORMAT = dwarf;
-				ENABLE_APP_SANDBOX = YES;
+				ENABLE_APP_SANDBOX = NO;
 				ENABLE_HARDENED_RUNTIME = YES;
-				ENABLE_INCOMING_NETWORK_CONNECTIONS = YES;
-				ENABLE_OUTGOING_NETWORK_CONNECTIONS = YES;
-				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = YES;
-				ENABLE_RESOURCE_ACCESS_USB = YES;
+				ENABLE_INCOMING_NETWORK_CONNECTIONS = NO;
+				ENABLE_OUTGOING_NETWORK_CONNECTIONS = NO;
+				ENABLE_RESOURCE_ACCESS_AUDIO_INPUT = NO;
+				ENABLE_RESOURCE_ACCESS_USB = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu11;
 				GCC_PRECOMPILE_PREFIX_HEADER = YES;
 				GCC_PREFIX_HEADER = "Limelight/macOS/Supporting Files/Limelight-Prefix.pch";
@@ -505,7 +532,7 @@
 				DEVELOPMENT_TEAM = 4439TAX9XJ;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
 				ENABLE_TESTABILITY = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu99;
 				GCC_DYNAMIC_NO_PIC = NO;
 				GCC_NO_COMMON_BLOCKS = YES;
@@ -561,7 +588,7 @@
 				DEVELOPMENT_TEAM = 4439TAX9XJ;
 				ENABLE_NS_ASSERTIONS = NO;
 				ENABLE_STRICT_OBJC_MSGSEND = YES;
-				ENABLE_USER_SCRIPT_SANDBOXING = YES;
+				ENABLE_USER_SCRIPT_SANDBOXING = NO;
 				GCC_C_LANGUAGE_STANDARD = gnu99;
 				GCC_NO_COMMON_BLOCKS = YES;
 				GCC_WARN_64_TO_32_BIT_CONVERSION = YES;
