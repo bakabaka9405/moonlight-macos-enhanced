@@ -1762,6 +1762,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleMouseModeToggledNotification:) name:HIDMouseModeToggledNotification object:nil];
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleGamepadQuitNotification:) name:HIDGamepadQuitNotification object:nil];
+    [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleCoreHIDMouseFailureNotification:) name:HIDCoreHIDMouseFailureNotification object:nil];
 
     // Listen for disconnect requests from the session manager
     [[NSNotificationCenter defaultCenter] addObserver:self selector:@selector(handleSessionDisconnectRequest:) name:@"StreamingSessionRequestDisconnect" object:nil];
@@ -2552,6 +2553,7 @@ highFreqMotor:(unsigned short)highFreqMotor {
     [[NSNotificationCenter defaultCenter] removeObserver:self.appDidResignActiveObserver];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:HIDMouseModeToggledNotification object:nil];
     [[NSNotificationCenter defaultCenter] removeObserver:self name:HIDGamepadQuitNotification object:nil];
+    [[NSNotificationCenter defaultCenter] removeObserver:self name:HIDCoreHIDMouseFailureNotification object:nil];
 
     if (self.activeSpaceDidChangeObserver) {
         [[[NSWorkspace sharedWorkspace] notificationCenter] removeObserver:self.activeSpaceDidChangeObserver];
@@ -8384,6 +8386,32 @@ static NSArray<NSNumber *> *bitrateStepsArray(void) {
 
 - (void)handleGamepadQuitNotification:(NSNotification *)note {
     [self requestStreamCloseWithSource:@"gamepad-quit-combo"];
+}
+
+- (void)handleCoreHIDMouseFailureNotification:(NSNotification *)note {
+    NSString *reason = note.userInfo[HIDCoreHIDFailureReasonUserInfoKey];
+    NSString *messageKey = note.userInfo[HIDCoreHIDFailureMessageKeyUserInfoKey];
+
+    if (reason.length == 0) {
+        reason = @"unknown";
+    }
+    if (messageKey.length == 0) {
+        messageKey = @"CoreHID Mouse input failed.";
+    }
+
+    if ([SettingsClass mouseDriverFor:self.app.host.uuid] != 2) {
+        Log(LOG_W, @"Ignoring CoreHID mouse failure notification because current driver is not CoreHID: reason=%@", reason);
+        return;
+    }
+
+    NSString *localizedMessage = MLString(messageKey, nil);
+    if (localizedMessage.length == 0) {
+        localizedMessage = messageKey;
+    }
+
+    NSString *toast = [NSString stringWithFormat:@"🖱️ %@", localizedMessage];
+    [self showNotification:toast forSeconds:3.0];
+    Log(LOG_W, @"CoreHID mouse unavailable: reason=%@ messageKey=%@", reason, messageKey);
 }
 
 - (void)showNotification:(NSString *)message {

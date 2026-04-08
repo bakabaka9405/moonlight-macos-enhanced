@@ -78,6 +78,7 @@
 				DatabaseSingleton.m,
 				Input/Controller.m,
 				Input/ControllerSupport.m,
+				Input/CoreHIDMouseDriver.swift,
 				Input/HapticContext.m,
 				Input/HIDSupport.m,
 				Input/Ticks.m,

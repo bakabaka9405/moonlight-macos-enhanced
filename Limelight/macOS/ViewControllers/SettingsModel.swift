@@ -812,7 +812,7 @@ class SettingsModel: ObservableObject {
   static var multiControllerModes: [String] = ["Single", "Auto"]
 
   static var controllerDrivers: [String] = ["HID", "MFi"]
-  static var mouseDrivers: [String] = ["HID", "MFi"]
+  static var mouseDrivers: [String] = ["HID", "MFi", "CoreHID"]
   static var mouseModes: [String] = ["game", "remote"]
   static var touchscreenModes: [String] = ["Trackpad", "Touchscreen"]
   static var displayModes: [String] = ["Windowed", "Fullscreen", "Borderless Windowed"]

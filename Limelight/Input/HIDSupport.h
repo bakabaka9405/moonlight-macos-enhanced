@@ -11,6 +11,9 @@
 
 extern NSString *const HIDMouseModeToggledNotification;
 extern NSString *const HIDGamepadQuitNotification;
+extern NSString *const HIDCoreHIDMouseFailureNotification;
+extern NSString *const HIDCoreHIDFailureReasonUserInfoKey;
+extern NSString *const HIDCoreHIDFailureMessageKeyUserInfoKey;
 
 @interface HIDInputDiagnosticsSnapshot : NSObject
 @property(nonatomic) NSUInteger mouseMoveEvents;

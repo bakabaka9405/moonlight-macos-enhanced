@@ -27,6 +27,15 @@
 
 NSString *const HIDMouseModeToggledNotification = @"HIDMouseModeToggledNotification";
 NSString *const HIDGamepadQuitNotification = @"HIDGamepadQuitNotification";
+NSString *const HIDCoreHIDMouseFailureNotification = @"HIDCoreHIDMouseFailureNotification";
+NSString *const HIDCoreHIDFailureReasonUserInfoKey = @"reason";
+NSString *const HIDCoreHIDFailureMessageKeyUserInfoKey = @"messageKey";
+
+typedef NS_ENUM(NSInteger, HIDMouseInputDriver) {
+    HIDMouseInputDriverHID = 0,
+    HIDMouseInputDriverMFi = 1,
+    HIDMouseInputDriverCoreHID = 2,
+};
 
 
 struct KeyMapping {
@@ -401,7 +410,7 @@ typedef enum {
 #define k_unSwitchUSBPacketLength k_unSwitchMaxOutputPacketLength
 
 
-@interface HIDSupport ()
+@interface HIDSupport () <CoreHIDMouseDriverDelegate>
 @property (nonatomic) dispatch_queue_t rumbleQueue;
 @property (nonatomic, strong) NSDictionary *mappings;
 @property (nonatomic) IOHIDManagerRef hidManager;
@@ -444,6 +453,9 @@ typedef enum {
 @property (nonatomic) id mouseDisconnectObserver;
 
 @property (nonatomic) BOOL useGCMouse;
+@property (nonatomic) BOOL useCoreHIDMouse;
+@property (nonatomic, strong) CoreHIDMouseDriver *coreHIDMouseDriver;
+@property (nonatomic) BOOL coreHIDFailurePosted;
 @property (nonatomic) dispatch_queue_t inputQueue;
 @property (atomic) uint64_t suppressRelativeMouseUntilMs;
 @property (nonatomic, strong) NSObject *inputDiagnosticsLock;
@@ -473,6 +485,12 @@ typedef enum {
                                          y:(short)y
                                      width:(short)width
                                     height:(short)height;
+- (void)dispatchRelativeMouseDeltaX:(CGFloat)deltaX
+                              deltaY:(CGFloat)deltaY
+                           sourceTag:(NSString *)sourceTag;
+- (void)setupCoreHIDMouseDriverIfNeeded;
+- (void)tearDownCoreHIDMouseDriver;
+- (void)postCoreHIDMouseFailureWithReason:(NSString *)reason messageKey:(NSString *)messageKey;
 @end
 
 static inline PML_INPUT_STREAM_CONTEXT HIDInputContext(HIDSupport *support) {
@@ -541,11 +559,22 @@ static inline short HIDScaledRelativeDelta(CGFloat delta, CGFloat sensitivity) {
     return (short)lrint(scaled);
 }
 
+static inline HIDMouseInputDriver HIDCurrentMouseInputDriver(HIDSupport *support) {
+    NSInteger configuredDriver = [SettingsClass mouseDriverFor:support.host.uuid];
+    if (configuredDriver == HIDMouseInputDriverMFi) {
+        return HIDMouseInputDriverMFi;
+    }
+    if (configuredDriver == HIDMouseInputDriverCoreHID) {
+        return HIDMouseInputDriverCoreHID;
+    }
+    return HIDMouseInputDriverHID;
+}
+
 static inline BOOL HIDShouldUseAbsolutePointerPath(HIDSupport *support, NSInteger touchscreenMode) {
     NSString *mouseMode = [SettingsClass mouseModeFor:support.host.uuid];
     BOOL remoteDesktopMode = [mouseMode isEqualToString:@"remote"];
 
-    if (support.useGCMouse) {
+    if (support.useGCMouse || support.useCoreHIDMouse) {
         return NO;
     }
 
@@ -709,6 +738,7 @@ SwitchCommonOutputPacket_t switchRumblePacket;
         self.inputQueue = dispatch_queue_create("com.moonlight.input", DISPATCH_QUEUE_SERIAL);
         self.inputDiagnosticsLock = [[NSObject alloc] init];
         [self resetInputDiagnostics];
+        self.coreHIDFailurePosted = NO;
         
         [self setupHidManager];
         
@@ -741,6 +771,7 @@ SwitchCommonOutputPacket_t switchRumblePacket;
         _mappings = [NSDictionary dictionaryWithDictionary:d];
         
         [self initializeDisplayLink];
+        [self setupCoreHIDMouseDriverIfNeeded];
     }
     return self;
 }
@@ -755,6 +786,108 @@ SwitchCommonOutputPacket_t switchRumblePacket;
         return;
     }
     self.suppressRelativeMouseUntilMs = LiGetMillis() + durationMs;
+}
+
+- (void)setupCoreHIDMouseDriverIfNeeded {
+    if (!self.useCoreHIDMouse) {
+        return;
+    }
+
+    if (self.coreHIDMouseDriver != nil) {
+        return;
+    }
+
+    self.coreHIDMouseDriver = [[CoreHIDMouseDriver alloc] init];
+    self.coreHIDMouseDriver.delegate = self;
+    [self.coreHIDMouseDriver start];
+}
+
+- (void)tearDownCoreHIDMouseDriver {
+    if (self.coreHIDMouseDriver == nil) {
+        return;
+    }
+
+    [self.coreHIDMouseDriver stop];
+    self.coreHIDMouseDriver.delegate = nil;
+    self.coreHIDMouseDriver = nil;
+}
+
+- (void)postCoreHIDMouseFailureWithReason:(NSString *)reason messageKey:(NSString *)messageKey {
+    @synchronized (self) {
+        if (self.coreHIDFailurePosted) {
+            return;
+        }
+        self.coreHIDFailurePosted = YES;
+    }
+
+    NSString *safeReason = reason.length > 0 ? reason : @"unknown";
+    NSString *safeMessageKey = messageKey.length > 0 ? messageKey : @"CoreHID Mouse input failed.";
+    Log(LOG_W, @"CoreHID mouse failure: reason=%@ messageKey=%@", safeReason, safeMessageKey);
+
+    dispatch_async(dispatch_get_main_queue(), ^{
+        [[NSNotificationCenter defaultCenter] postNotificationName:HIDCoreHIDMouseFailureNotification
+                                                            object:nil
+                                                          userInfo:@{
+                                                              HIDCoreHIDFailureReasonUserInfoKey: safeReason,
+                                                              HIDCoreHIDFailureMessageKeyUserInfoKey: safeMessageKey,
+                                                          }];
+    });
+}
+
+- (void)dispatchRelativeMouseDeltaX:(CGFloat)deltaX
+                              deltaY:(CGFloat)deltaY
+                           sourceTag:(NSString *)sourceTag {
+    if (deltaX == 0 && deltaY == 0) {
+        return;
+    }
+
+    if (!self.shouldSendInputEvents) {
+        return;
+    }
+
+    PML_INPUT_STREAM_CONTEXT inputCtx = HIDInputContext(self);
+    if (!inputCtx) {
+        return;
+    }
+
+    NSInteger touchscreenMode = [SettingsClass touchscreenModeFor:self.host.uuid];
+    if (HIDShouldUseAbsolutePointerPath(self, touchscreenMode)) {
+        return;
+    }
+
+    BOOL suppressed = HIDShouldSuppressRelativeMouse(self);
+    CGFloat sensitivity = HIDPointerSensitivityForHost(self.host);
+    short moveX = HIDScaledRelativeDelta(deltaX, sensitivity);
+    short moveY = HIDScaledRelativeDelta(deltaY, sensitivity);
+    [self recordRelativeInputDiagnosticsFrom:sourceTag
+                                   rawDeltaX:deltaX
+                                   rawDeltaY:deltaY
+                                  sentDeltaX:(suppressed ? 0 : moveX)
+                                  sentDeltaY:(suppressed ? 0 : moveY)
+                                  suppressed:suppressed];
+    if (suppressed || (moveX == 0 && moveY == 0)) {
+        return;
+    }
+
+    HIDDispatchInput(self, inputCtx, ^{
+        LiSendMouseMoveEventCtx(inputCtx, moveX, moveY);
+    });
+}
+
+- (void)coreHIDMouseDriver:(CoreHIDMouseDriver *)driver didReceiveDeltaX:(double)deltaX deltaY:(double)deltaY {
+    (void)driver;
+    if (!self.useCoreHIDMouse) {
+        return;
+    }
+
+    [self dispatchRelativeMouseDeltaX:(CGFloat)deltaX
+                               deltaY:(CGFloat)deltaY
+                            sourceTag:@"coreHIDMouse"];
+}
+
+- (void)coreHIDMouseDriver:(CoreHIDMouseDriver *)driver didFailWithReason:(NSString *)reason messageKey:(NSString *)messageKey {
+    (void)driver;
+    [self postCoreHIDMouseFailureWithReason:reason messageKey:messageKey];
 }
 
 -(void)registerMouseCallbacks:(GCMouse *)mouse API_AVAILABLE(macos(11.0)) {
@@ -883,38 +1016,10 @@ static CVReturn displayLinkOutputCallback(CVDisplayLinkRef displayLink,
     if (deltaX != 0 || deltaY != 0) {
         me.mouseDeltaX = 0;
         me.mouseDeltaY = 0;
-        if (me.shouldSendInputEvents) {
-            PML_INPUT_STREAM_CONTEXT inputCtx = HIDInputContext(me);
-            if (!inputCtx) {
-                return kCVReturnSuccess;
-            }
-            NSInteger touchscreenMode = [SettingsClass touchscreenModeFor:me.host.uuid];
-            BOOL useAbsolutePointerPath = HIDShouldUseAbsolutePointerPath(me, touchscreenMode);
-            if (!useAbsolutePointerPath) {
-                BOOL suppressed = HIDShouldSuppressRelativeMouse(me);
-                if (suppressed) {
-                    [me recordRelativeInputDiagnosticsFrom:@"gcMouse"
-                                                 rawDeltaX:deltaX
-                                                 rawDeltaY:deltaY
-                                                sentDeltaX:0
-                                                sentDeltaY:0
-                                                suppressed:YES];
-                    return kCVReturnSuccess;
-                }
-                CGFloat sensitivity = HIDPointerSensitivityForHost(me.host);
-                short moveX = HIDScaledRelativeDelta(deltaX, sensitivity);
-                short moveY = HIDScaledRelativeDelta(deltaY, sensitivity);
-                [me recordRelativeInputDiagnosticsFrom:@"gcMouse"
-                                             rawDeltaX:deltaX
-                                             rawDeltaY:deltaY
-                                            sentDeltaX:moveX
-                                            sentDeltaY:moveY
-                                            suppressed:NO];
-                HIDDispatchInput(me, inputCtx, ^{
-                    LiSendMouseMoveEventCtx(inputCtx, moveX, moveY);
-                });
-            }
-        }
+        NSString *relativeSource = me.useCoreHIDMouse ? @"coreHIDMouse" : @"gcMouse";
+        [me dispatchRelativeMouseDeltaX:deltaX
+                                 deltaY:deltaY
+                              sourceTag:relativeSource];
     }
     
     // Mouse Emulation Movement
@@ -1139,7 +1244,7 @@ static CVReturn displayLinkOutputCallback(CVDisplayLinkRef displayLink,
 }
 
 - (void)mouseMoved:(NSEvent *)event {
-    if (self.useGCMouse) {
+    if (self.useGCMouse || self.useCoreHIDMouse) {
         return;
     }
     
@@ -1672,7 +1777,11 @@ static CVReturn displayLinkOutputCallback(CVDisplayLinkRef displayLink,
 }
 
 - (BOOL)useGCMouse {
-    return [SettingsClass mouseDriverFor:self.host.uuid];
+    return HIDCurrentMouseInputDriver(self) == HIDMouseInputDriverMFi;
+}
+
+- (BOOL)useCoreHIDMouse {
+    return HIDCurrentMouseInputDriver(self) == HIDMouseInputDriverCoreHID;
 }
 
 - (NSInteger)controllerDriver {
@@ -2449,6 +2558,7 @@ void myHIDDeviceRemovalCallback(void * _Nullable        context,
     for (GCMouse *mouse in GCMouse.mice) {
         [self unregisterMouseCallbacks:mouse];
     }
+    [self tearDownCoreHIDMouseDriver];
 
     if (self.displayLink != NULL) {
         CVDisplayLinkStop(self.displayLink);
